@@ -2732,6 +2732,129 @@ class HgConfig(VC):
                 return None
 
 
+class NotYetImplemented(Exception):
+    pass
+
+
+class GitConfig(VC):
+    """
+    Encapsulates access to Mercurial (hg)
+    """
+    def __init__(self):
+        VC.__init__(self, 'git', 'Git')
+        self._missing = 'no git executable found'
+        self._has_git = None
+
+    def check(self, abortOnError = True):
+        # Mercurial does lazy checking before use of the hg command itself
+        return self
+
+    def _check_for_git(self, abortOnError=True):
+        # TODO: break this out into some hg/git common code!!
+        if self._has_git is None:
+            try:
+                subprocess.check_output(['git'])
+                self._has_git = True
+            except OSError:
+                self._has_git = False
+                warn(self._missing)
+
+        if not self._has_git:
+            if abortOnError:
+                abort(self._missing)
+            else:
+                warn(self._missing)
+
+        return self if self._has_git else None
+
+    def run(self, *args, **kwargs):
+        # Ensure hg exists before executing the command
+        self._check_for_git()
+        return run(*args, **kwargs)
+
+    def init(self, vcdir, abortOnError=True):
+        return self.run(['git', 'init'], cwd=vcdir, nonZeroIsFatal=abortOnError) == 0
+
+    def is_this_vc(self, vcdir):
+        dir_ = join(vcdir, self.metadir())
+        return os.path.exists(dir_)
+
+    def hg_command(self, vcdir, args, abortOnError=False, quiet=False):
+        args = ['git', '-C', vcdir] + args
+        if not quiet:
+            print '{0}'.format(" ".join(args))
+        out = OutputCapture()
+        rc = self.run(args, nonZeroIsFatal=False, out=out)
+        if rc == 0 or rc == 1:
+            return out.data
+        else:
+            if abortOnError:
+                abort(" ".join(args) + ' returned ' + str(rc))
+            return None
+
+    def add(self, vcdir, path, abortOnError=True):
+        raise NotYetImplemented()
+
+    def commit(self, vcdir, msg, abortOnError=True):
+        raise NotYetImplemented()
+
+    def tip(self, vcdir, abortOnError=True):
+        self._check_for_git()
+        raise NotYetImplemented()
+
+    def parent(self, vcdir, abortOnError=True):
+        self._check_for_git()
+        raise NotYetImplemented()
+
+    def release_version_from_tags(self, vcdir, prefix, snapshotSuffix='dev', abortOnError=True):
+        raise NotYetImplemented()
+
+    def metadir(self):
+        return '.git'
+
+    def clone(self, url, dest=None, rev=None, abortOnError=True, **extra_args):
+        raise NotYetImplemented()
+
+    def incoming(self, vcdir, abortOnError=True):
+        raise NotYetImplemented()
+
+    def outgoing(self, vcdir, dest=None, abortOnError=True):
+        raise NotYetImplemented()
+
+    def pull(self, vcdir, rev=None, update=False, abortOnError=True):
+        raise NotYetImplemented()
+
+    def can_push(self, vcdir, strict=True, abortOnError=True):
+        raise NotYetImplemented()
+
+    def _path(self, vcdir, name, abortOnError=True):
+        raise NotYetImplemented()
+
+    def default_push(self, vcdir, abortOnError=True):
+        raise NotYetImplemented()
+
+    def default_pull(self, vcdir, abortOnError=True):
+        raise NotYetImplemented()
+
+    def push(self, vcdir, dest=None, rev=None, abortOnError=False):
+        raise NotYetImplemented()
+
+    def update(self, vcdir, rev=None, mayPull=False, clean=False, abortOnError=False):
+        raise NotYetImplemented()
+
+    def locate(self, vcdir, patterns=None, abortOnError=True):
+        raise NotYetImplemented()
+
+    def isDirty(self, vcdir, abortOnError=True):
+        raise NotYetImplemented()
+
+    def bookmark(self, vcdir, name, rev, abortOnError=True):
+        raise NotYetImplemented()
+
+    def latest(self, vcdir, rev1, rev2, abortOnError=True):
+        raise NotYetImplemented()
+
+
 class BinaryVC(VC):
     """
     Emulates a VC system for binary suites, as far as possible, but particularly pull/tip
@@ -10512,7 +10635,7 @@ def main():
     vc_command = _check_vc_command()
 
     global _vc_systems
-    _vc_systems = [HgConfig(), BinaryVC()]
+    _vc_systems = [HgConfig(), GitConfig(), BinaryVC()]
     global _mvn
     _mvn = MavenConfig()
 
