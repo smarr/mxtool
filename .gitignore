@@ -1,0 +1,4 @@
+*.pyc
+.jdk*
+lib
+java
