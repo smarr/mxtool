@@ -25,7 +25,6 @@
 #
 # ----------------------------------------------------------------------------------------------------
 #
-from os import getenv
 r"""
 mx is a command line tool for managing the development of Java code organized as suites of projects.
 
@@ -63,12 +62,11 @@ from os.path import join, basename, dirname, exists, getmtime, isabs, expandvars
 
 import mx_unittest
 import mx_findbugs
+import mx_sigtest
 import mx_gate
 import mx_compat
 
-
 _mx_home = os.path.realpath(dirname(__file__))
-
 
 try:
     # needed to work around https://bugs.python.org/issue1927
@@ -149,7 +147,7 @@ def nyi(name, obj):
 """
 Names of commands that do not need suites loaded.
 """
-_suite_context_free = []
+_suite_context_free = ['scloneimports']
 
 """
 Decorator for commands that do not need suites loaded.
@@ -463,7 +461,7 @@ class ClasspathDependency(Dependency):
     def isJar(self):
         cp_repr = self.classpath_repr()
         if cp_repr:
-            return cp_repr.endswith('.jar') or cp_repr.endswith('.JAR')
+            return cp_repr.endswith('.jar') or cp_repr.endswith('.JAR') or '.jar_' in cp_repr
         return True
 
 """
@@ -720,10 +718,11 @@ class Distribution(Dependency):
         Gets the projects and libraries whose artifacts are the contents of the archive
         created by self.make_archive().
 
-        Direct distribution depdenencies are considered as "distDependencies".
+        Direct distribution dependencies are considered as "distDependencies".
         Anything contained in the distDependencies will not be included in the archived_deps.
-        libraries listed in "excludedLibs" will also not bed included.
-        Otherwise, archived_deps will contain everything this distribution depends on (including indirect distribution depdenencies and libraries).
+        libraries listed in "excludedLibs" will also not be included.
+        Otherwise, archived_deps will contain everything this distribution depends on (including
+        indirect distribution dependencies and libraries).
         '''
         if not hasattr(self, '_archived_deps'):
             excluded = set(self.excludedLibs)
@@ -1204,11 +1203,24 @@ class Project(Dependency):
         """
         nyi('eclipse_settings_sources', self)
 
+    def eclipse_config_up_to_date(self, configZip):
+        """
+        Determines if the zipped up Eclipse configuration
+        """
+        return True
+
     def get_javac_lint_overrides(self):
         """
         Gets a string to be added to the -Xlint javac option.
         """
         nyi('get_javac_lint_overrides', self)
+
+    def _eclipseinit(self, files=None, libFiles=None):
+        """
+        Generates an Eclipse project configuration for this project if Eclipse
+        supports projects of this type.
+        """
+        pass
 
 class ProjectBuildTask(BuildTask):
     def __init__(self, args, parallelism, project):
@@ -1284,6 +1296,13 @@ class JavaProject(Project, ClasspathDependency):
                 overrides += getattr(self, 'javac.lint.overrides').split(',')
             self._javac_lint_overrides = overrides
         return self._javac_lint_overrides
+
+    def eclipse_config_up_to_date(self, configZip):
+        for _, sources in self.eclipse_settings_sources().iteritems():
+            for source in sources:
+                if configZip.isOlderThan(source):
+                    return False
+        return True
 
     def eclipse_settings_sources(self):
         """
@@ -1445,9 +1464,9 @@ class JavaProject(Project, ClasspathDependency):
         aps = self.annotation_processors()
         if len(aps):
             entries = classpath_entries(names=aps)
-            invalid = [e for e in entries if not e.isJar()]
+            invalid = [e.classpath_repr(resolve=True) for e in entries if not e.isJar()]
             if invalid:
-                abort('Annotation processor path can only contain jars: ' + str(invalid))
+                abort('Annotation processor path can only contain jars: ' + str(invalid), context=self)
             return os.pathsep.join((e for e in (e.classpath_repr(resolve=True) for e in entries) if e))
         return None
 
@@ -1490,6 +1509,12 @@ class JavaProject(Project, ClasspathDependency):
                     arcname = join(relpath, f).replace(os.sep, '/')
                     arc.zf.write(join(root, f), arcname)
         return path
+
+    def _eclipseinit(self, files=None, libFiles=None):
+        """
+        Generates an Eclipse project configuration for this project.
+        """
+        _eclipseinit_project(self, files=files, libFiles=libFiles)
 
     def getBuildTask(self, args):
         requiredCompliance = self.javaCompliance if self.javaCompliance else JavaCompliance(args.compliance) if args.compliance else None
@@ -1816,7 +1841,7 @@ class ECJCompiler(JavacLikeCompiler):
         jdtPropertiesSources = project.eclipse_settings_sources()['org.eclipse.jdt.core.prefs']
         if not exists(jdtProperties) or TimeStampFile(jdtProperties).isOlderThan(jdtPropertiesSources):
             # Try to fix a missing or out of date properties file by running eclipseinit
-            _eclipseinit_project(project)
+            project._eclipseinit()
         if not exists(jdtProperties):
             log('JDT properties file {0} not found'.format(jdtProperties))
         else:
@@ -1962,6 +1987,28 @@ def sha1OfFile(path):
             d.update(buf)
         return d.hexdigest()
 
+def _get_path_in_cache(name, sha1, urls, ext=None):
+    """
+    Gets the path an artifact has (or would have) in the download cache.
+    """
+    assert sha1 != 'NOCHECK', 'artifact for ' + name + ' cannot be cached since its sha1 is NOCHECK'
+    userHome = _opts.user_home if hasattr(_opts, 'user_home') else os.path.expanduser('~')
+    if ext is None:
+        for url in urls:
+            # Use extension of first URL whose path component ends with a non-empty extension
+            _, _, path, _, query, _ = urlparse.urlparse(url)
+            if path == "/remotecontent" and query.startswith("filepath"):
+                path = query
+            _, ext = os.path.splitext(path)
+            if ext:
+                break
+        if not ext:
+            abort('Could not determine a file extension from URL(s):\n  ' + '\n  '.join(urls))
+    cacheDir = _cygpathW2U(get_env('MX_CACHE_DIR', join(userHome, '.mx', 'cache')))
+    assert os.sep not in name, name + ' cannot contain ' + os.sep
+    assert os.pathsep not in name, name + ' cannot contain ' + os.pathsep
+    return join(cacheDir, name + '_' + sha1 + ext)
+
 def download_file_with_sha1(name, path, urls, sha1, sha1path, resolve, mustExist, sources=False, canSymlink=True):
     '''
     Downloads an entity from a URL in the list 'urls' (tried in order) to 'path',
@@ -1981,33 +2028,47 @@ def download_file_with_sha1(name, path, urls, sha1, sha1path, resolve, mustExist
 
         cacheDir = _cygpathW2U(get_env('MX_CACHE_DIR', join(_opts.user_home, '.mx', 'cache')))
         ensure_dir_exists(cacheDir)
-        base = basename(path)
-        cachePath = join(cacheDir, base + '_' + sha1)
+
+        _, ext = os.path.splitext(path)
+        cachePath = _get_path_in_cache(name, sha1, urls, ext=ext)
 
         if not exists(cachePath) or (sha1Check and sha1OfFile(cachePath) != sha1):
             if exists(cachePath):
                 log('SHA1 of ' + cachePath + ' does not match expected value (' + sha1 + ') - found ' + sha1OfFile(cachePath) + ' - re-downloading')
-            log('Downloading ' + ("sources " if sources else "") + name + ' from ' + str(urls))
-            download(cachePath, urls)
 
-        d = dirname(path)
-        if d != '':
-            ensure_dir_exists(d)
-        if canSymlink and 'symlink' in dir(os):
-            logvv('Symlinking {} to {}'.format(path, cachePath))
-            if os.path.lexists(path):
-                os.unlink(path)
-            try:
-                os.symlink(cachePath, path)
-            except OSError as e:
-                # When doing parallel building, the symlink can fail
-                # if another thread wins the race to create the symlink
-                if not os.path.lexists(path):
-                    # It was some other error
-                    raise Exception(path, e)
-        else:
-            logvv('Copying {} to {}'.format(path, cachePath))
-            shutil.copy(cachePath, path)
+            def _findLegacyCachePath():
+                for e in os.listdir(cacheDir):
+                    if sha1 in e and sha1OfFile(join(cacheDir, e)) == sha1:
+                        return join(cacheDir, e)
+                return None
+
+            legacyCachePath = _findLegacyCachePath()
+            if legacyCachePath:
+                logvv('Copying {} to {}'.format(legacyCachePath, cachePath))
+                shutil.move(legacyCachePath, cachePath)
+            else:
+                log('Downloading ' + ("sources " if sources else "") + name + ' from ' + str(urls))
+                download(cachePath, urls)
+
+        if path != cachePath:
+            d = dirname(path)
+            if d != '':
+                ensure_dir_exists(d)
+            if canSymlink and 'symlink' in dir(os):
+                logvv('Symlinking {} to {}'.format(path, cachePath))
+                if os.path.lexists(path):
+                    os.unlink(path)
+                try:
+                    os.symlink(cachePath, path)
+                except OSError as e:
+                    # When doing parallel building, the symlink can fail
+                    # if another thread wins the race to create the symlink
+                    if not os.path.lexists(path):
+                        # It was some other error
+                        raise Exception(path, e)
+            else:
+                logvv('Copying {} to {}'.format(path, cachePath))
+                shutil.copy(cachePath, path)
 
         if not _check_file_with_sha1(path, sha1, sha1path, newFile=True):
             log('SHA1 of ' + sha1OfFile(cachePath) + ' does not match expected value (' + sha1 + ')')
@@ -3815,6 +3876,7 @@ class Suite:
         self.versionConflictResolution = 'none' if importing_suite is None else importing_suite.versionConflictResolution
         self.dynamicallyImported = dynamicallyImported
         _suites[self.name] = self
+        self._outputRoot = None
 
     def __str__(self):
         return self.name
@@ -3839,7 +3901,9 @@ class Suite:
         Gets the root of the directory hierarchy under which generated artifacts for this
         suite such as class files and annotation generated sources should be placed.
         '''
-        return self.getMxCompatibility().getSuiteOutputRoot(self)
+        if not self._outputRoot:
+            self._outputRoot = self.getMxCompatibility().getSuiteOutputRoot(self)
+        return self._outputRoot
 
     def get_mx_output_dir(self):
         '''
@@ -3901,9 +3965,30 @@ class Suite:
         if not hasattr(module, dictName):
             abort(modulePath + ' must define a variable named "' + dictName + '"')
         d = expand(getattr(module, dictName), [dictName])
-        sections = ['imports', 'projects', 'libraries', 'jrelibraries', 'jdklibraries', 'distributions', 'name', 'mxversion', 'versionConflictResolution', 'developer', 'url', 'licenses', 'licences', 'defaultLicense', 'defaultLicence', 'repositories', 'javac.lint.overrides']
+        supported = [
+            'imports',
+            'projects',
+            'libraries',
+            'jrelibraries',
+            'jdklibraries',
+            'distributions',
+            'name',
+            'outputRoot',
+            'mxversion',
+            'versionConflictResolution',
+            'developer',
+            'url',
+            'licenses',
+            'licences',
+            'defaultLicense',
+            'defaultLicence',
+            'repositories',
+            'javac.lint.overrides'
+        ]
 
-        if d.has_key('mxversion'):
+        if self.name == 'mx':
+            self.requiredMxVersion = version
+        elif d.has_key('mxversion'):
             try:
                 self.requiredMxVersion = VersionSpec(d['mxversion'])
             except AssertionError as ae:
@@ -3925,9 +4010,9 @@ class Suite:
         if javacLintOverrides:
             self.javacLintOverrides = javacLintOverrides.split(',')
 
-        unknown = frozenset(d.keys()) - frozenset(sections)
+        unknown = frozenset(d.keys()) - frozenset(supported)
         if unknown:
-            abort(modulePath + ' defines unsupported suite sections: ' + ', '.join(unknown))
+            abort(modulePath + ' defines unsupported suite attribute: ' + ', '.join(unknown))
 
         self.suiteDict = d
 
@@ -4003,8 +4088,10 @@ class Suite:
         if suiteDict.get('name') is None:
             abort('Missing "suite=<name>" in ' + self.suite_py())
 
-        if suiteDict.get('name') != self.name:
-            abort('suite name in project file does not match ' + self.name)
+        outputRoot = suiteDict.get('outputRoot')
+        if outputRoot:
+            assert not self._outputRoot or self._outputRoot == outputRoot, self._outputRoot
+            self._outputRoot = os.path.realpath(_make_absolute(outputRoot.replace('/', os.sep), self.dir))
 
         libsMap = self._check_suiteDict('libraries')
         jreLibsMap = self._check_suiteDict('jrelibraries')
@@ -4159,9 +4246,11 @@ class Suite:
             path = attrs.pop('path')
             d = NativeTARDistribution(self, name, deps, path, exclLibs, platformDependent, theLicense)
         else:
+            defaultPath = join(self.get_output_root(), 'dists', _map_to_maven_dist_name(name) + '.jar')
+            defaultSourcesPath = join(self.get_output_root(), 'dists', _map_to_maven_dist_name(name) + '.src.zip')
             subDir = attrs.pop('subDir', None)
-            path = attrs.pop('path', join(self.dir, 'dists', _map_to_maven_dist_name(name) + '.jar'))
-            sourcesPath = attrs.pop('sourcesPath', None)
+            path = attrs.pop('path', defaultPath)
+            sourcesPath = attrs.pop('sourcesPath', defaultSourcesPath)
             mainClass = attrs.pop('mainClass', None)
             distDeps = Suite._pop_list(attrs, 'distDependencies', context)
             javaCompliance = attrs.pop('javaCompliance', None)
@@ -4182,7 +4271,7 @@ class Suite:
         if not v:
             return []
         if not isinstance(v, list):
-            abort('Attribute "' + name + '" for ' + context + ' must be a list')
+            abort('Attribute "' + name + '" for ' + context + ' must be a list', context)
         return v
 
     @staticmethod
@@ -4224,12 +4313,24 @@ class Suite:
             os_arch = Suite._pop_os_arch(attrs, context)
             Suite._merge_os_arch_attrs(attrs, os_arch, context)
             deps = Suite._pop_list(attrs, 'dependencies', context)
-            path = attrs.pop('path')
+            path = attrs.pop('path', None)
             urls = Suite._pop_list(attrs, 'urls', context)
             sha1 = attrs.pop('sha1', None)
+            ext = attrs.pop('ext', None)
+            if path is None:
+                if not urls:
+                    abort('Library without "path" attribute must have a non-empty "urls" list attribute', context)
+                if not sha1:
+                    abort('Library without "path" attribute must have a non-empty "sha1" attribute', context)
+                path = _get_path_in_cache(name, sha1, urls, ext)
             sourcePath = attrs.pop('sourcePath', None)
             sourceUrls = Suite._pop_list(attrs, 'sourceUrls', context)
             sourceSha1 = attrs.pop('sourceSha1', None)
+            sourceExt = attrs.pop('sourceExt', None)
+            if sourcePath is None and sourceUrls:
+                if not sourceSha1:
+                    abort('Library without "sourcePath" attribute but with non-empty "sourceUrls" attribute must have a non-empty "sourceSha1" attribute', context)
+                sourcePath = _get_path_in_cache(name + '.sources', sourceSha1, sourceUrls, sourceExt)
             theLicense = attrs.pop(self.getMxCompatibility().licenseAttribute(), None)
             optional = attrs.pop('optional', False)
             l = Library(self, name, path, optional, urls, sha1, sourcePath, sourceUrls, sourceSha1, deps, theLicense)
@@ -4328,7 +4429,8 @@ class Suite:
                                             s.vc.pull(s.dir, rev=suite_import.version, update=False)
                                         resolved = s.vc.latest(s.dir, suite_import.version, s.vc.parent(s.dir))
                                         # TODO currently this only handles simple DAGs and it will always do an update assuming that the repo is at a version controlled by mx
-                                        s.vc.update(s.dir, rev=resolved)
+                                        if s.vc.parent(s.dir) != resolved:
+                                            s.vc.update(s.dir, rev=resolved)
                 return s
 
         searchMode = 'binary' if _binary_suites is not None and (len(_binary_suites) == 0 or suite_import.name in _binary_suites) else 'source'
@@ -4927,6 +5029,8 @@ def get_jython_os():
         return 'darwin'
     elif os_name.startswith('linux'):
         return 'linux'
+    elif os_name.startswith('openbsd'):
+        return 'openbsd'
     elif os_name.startswith('sunos'):
         return 'solaris'
     elif os_name.startswith('win'):
@@ -4944,6 +5048,8 @@ def get_os():
         return 'darwin'
     elif sys.platform.startswith('linux'):
         return 'linux'
+    elif sys.platform.startswith('openbsd'):
+        return 'openbsd'
     elif sys.platform.startswith('sunos'):
         return 'solaris'
     elif sys.platform.startswith('win32'):
@@ -5016,6 +5122,13 @@ def vc_system(kind, abortOnError=True):
         abort('no VC system named ' + kind)
     else:
         return None
+
+def get_opts():
+    """
+    Gets the parsed command line options.
+    """
+    assert _argParser.parsed is True
+    return _opts
 
 def suites(opt_limit_to_suite=False, includeBinary=True):
     """
@@ -5434,6 +5547,7 @@ class ArgParser(ArgumentParser):
 
 
     def __init__(self, parents=None):
+        self.parsed = False
         if not parents:
             parents = []
         ArgumentParser.__init__(self, prog='mx', parents=parents, add_help=len(parents) != 0)
@@ -5561,6 +5675,7 @@ class ArgParser(ArgumentParser):
             commandAndArgs = opts.__dict__.pop('commandAndArgs')
             if self.initialCommandAndArgs != commandAndArgs:
                 abort('Suite specific global options must use name=value format: {0}={1}'.format(self.unknown[-1], self.initialCommandAndArgs[0]))
+            self.parsed = True
             return commandAndArgs
 
 def _format_commands():
@@ -5925,6 +6040,9 @@ _os_jdk_locations = {
             '/usr/java'
         ]
     },
+    'openbsd': {
+        'bases': ['/usr/local/']
+    },
     'solaris': {
         'bases': ['/usr/jdk/instances']
     },
@@ -6084,7 +6202,7 @@ def waitOn(p):
 
 def run_maven(args, nonZeroIsFatal=True, out=None, err=None, cwd=None, timeout=None, env=None):
     mavenCommand = 'mvn'
-    mavenHome = getenv('MAVEN_HOME')
+    mavenHome = os.getenv('MAVEN_HOME')
     if mavenHome:
         mavenCommand = join(mavenHome, 'bin', mavenCommand)
     return run([mavenCommand] + args, nonZeroIsFatal=nonZeroIsFatal, out=out, err=err, timeout=timeout, env=env, cwd=cwd)
@@ -6097,7 +6215,7 @@ def run_mx(args, suite=None, nonZeroIsFatal=True, out=None, err=None, timeout=No
         cwd = suite.dir
     return run(commands + args, nonZeroIsFatal=nonZeroIsFatal, out=out, err=err, timeout=timeout, env=env, cwd=cwd)
 
-def run(args, nonZeroIsFatal=True, out=None, err=None, cwd=None, timeout=None, env=None):
+def run(args, nonZeroIsFatal=True, out=None, err=None, cwd=None, timeout=None, env=None, **kwargs):
     """
     Run a command in a subprocess, wait for it to complete and return the exit status of the process.
     If the exit status is non-zero and `nonZeroIsFatal` is true, then mx is exited with
@@ -6156,7 +6274,7 @@ def run(args, nonZeroIsFatal=True, out=None, err=None, cwd=None, timeout=None, e
             stream.close()
         stdout = out if not callable(out) else subprocess.PIPE
         stderr = err if not callable(err) else subprocess.PIPE
-        p = subprocess.Popen(args, cwd=cwd, stdout=stdout, stderr=stderr, preexec_fn=preexec_fn, creationflags=creationflags, env=env)
+        p = subprocess.Popen(args, cwd=cwd, stdout=stdout, stderr=stderr, preexec_fn=preexec_fn, creationflags=creationflags, env=env, **kwargs)
         sub = _addSubprocess(p, args)
         joiners = []
         if callable(out):
@@ -6214,7 +6332,7 @@ def add_lib_prefix(name):
     Adds the platform specific library prefix to a name
     """
     os = get_os()
-    if os == 'linux' or os == 'solaris' or os == 'darwin':
+    if os in ['darwin', 'linux', 'openbsd', 'solaris']:
         return 'lib' + name
     return name
 
@@ -6225,7 +6343,7 @@ def add_lib_suffix(name):
     os = get_os()
     if os == 'windows':
         return name + '.dll'
-    if os == 'linux' or os == 'solaris':
+    if os in ['linux', 'openbsd', 'solaris']:
         return name + '.so'
     if os == 'darwin':
         return name + '.dylib'
@@ -6238,7 +6356,7 @@ def add_debug_lib_suffix(name):
     os = get_os()
     if os == 'windows':
         return name + '.pdb'
-    if os == 'linux' or os == 'solaris':
+    if os in ['linux', 'openbsd', 'solaris']:
         return name + '.debuginfo'
     if os == 'darwin':
         return name + '.dylib.dSYM'
@@ -6763,7 +6881,7 @@ def build(args, parser=None):
     parser.add_argument('-c', action='store_true', dest='clean', help='removes existing build output')
     parallelize = parser.add_mutually_exclusive_group()
     parallelize.add_argument('-n', '--serial', action='store_const', const=False, dest='parallelize', help='serialize Java compilation')
-    parallelize.add_argument('-p', action='store_const', const=True, dest='parallelize', help='parallelize Java compilation')
+    parallelize.add_argument('-p', action='store_const', const=True, dest='parallelize', help='parallelize Java compilation (default)')
     parser.add_argument('-s', '--shallow-dependency-checks', action='store_const', const=True, help="ignore modification times "\
                         "of output files for each of P's dependencies when determining if P should be built. That "\
                         "is, only P's sources, suite.py of its suite and whether any of P's dependencies have "\
@@ -7237,12 +7355,13 @@ def pylint(args):
 
     pyfiles = []
 
-    # Add mxtool's own py files
-    for root, _, files in os.walk(dirname(__file__)):
-        for f in files:
-            if f.endswith('.py'):
-                pyfile = join(root, f)
-                pyfiles.append(pyfile)
+    # Process mxtool's own py files only if mx is the primary suite
+    if _primary_suite is _mx_suite:
+        for root, _, files in os.walk(dirname(__file__)):
+            for f in files:
+                if f.endswith('.py'):
+                    pyfile = join(root, f)
+                    pyfiles.append(pyfile)
     if args.walk:
         findfiles_by_walk(pyfiles)
     else:
@@ -7343,16 +7462,26 @@ def checkoverlap(args):
         for p in d.archived_deps():
             if p.isProject():
                 if p in projToDist:
-                    projToDist[p].append(d.name)
+                    projToDist[p].append(d)
                 else:
-                    projToDist[p] = [d.name]
+                    projToDist[p] = [d]
 
     count = 0
     for p in projToDist:
         ds = projToDist[p]
         if len(ds) > 1:
-            print '{} is in more than one distribution: {}'.format(p, ds)
-            count += 1
+            remove = []
+            for d in ds:
+                if hasattr(d, 'overlaps'):
+                    overlaps = d.overlaps
+                    if not isinstance(overlaps, list):
+                        abort('Attribute "overlaps" must be a list', d)
+                    if len([o for o in ds if o.name in overlaps]) != 0:
+                        remove.append(d)
+            ds = [d for d in ds if d not in remove]
+            if len(ds) > 1:
+                print '{} is in more than one distribution: {}'.format(p, [d.name for d in ds])
+                count += 1
     return count
 
 def canonicalizeprojects(args):
@@ -7894,7 +8023,10 @@ def eclipseinit(args, buildProcessorJars=True, refreshOnly=False):
     generate_eclipse_workingsets()
 
 def _check_ide_timestamp(suite, configZip, ide):
-    """return True if and only if the projects file, imports file, eclipse-settings files, and mx itself are all older than configZip"""
+    """
+    Returns True if and only if suite.py for *suite*, all *configZip* related resources in
+    *suite* and mx itself are older than *configZip*.
+    """
     suitePyFiles = [join(suite.mxDir, e) for e in os.listdir(suite.mxDir) if e == 'suite.py']
     if configZip.isOlderThan(suitePyFiles):
         return False
@@ -7903,14 +8035,29 @@ def _check_ide_timestamp(suite, configZip, ide):
         return False
 
     if ide == 'eclipse':
-        for p in [p for p in suite.projects if p.isJavaProject()]:
-            for _, sources in p.eclipse_settings_sources().iteritems():
-                for source in sources:
-                    if configZip.isOlderThan(source):
-                        return False
+        for p in [p for p in suite.projects]:
+            if not p.eclipse_config_up_to_date(configZip):
+                return False
     return True
 
 EclipseLinkedResource = namedtuple('LinkedResource', ['name', 'type', 'location'])
+def _eclipse_linked_resource(name, tp, location):
+    return EclipseLinkedResource(name, tp, location)
+
+def get_eclipse_project_rel_locationURI(path, eclipseProjectDir):
+    """
+    Gets the URI for a resource relative to an Eclipse project directory (i.e.,
+    the directory containing the ```.project``` file for the project). The URI
+    returned is based on the builtin PROJECT_LOC Eclipse variable.
+    See http://stackoverflow.com/a/7585095
+    """
+    relpath = os.path.relpath(path, eclipseProjectDir)
+    names = relpath.split(os.sep)
+    parents = len([n for n in names if n == '..'])
+    sep = '/' # Yes, even on Windows...
+    if parents:
+        return join('PARENT-{}-PROJECT_LOC'.format(parents), sep.join([n for n in names if n != '..']))
+    return join('PROJECT_LOC', sep.join([n for n in names if n != '..']))
 
 def _eclipseinit_project(p, files=None, libFiles=None):
     assert get_jdk(p.javaCompliance)
@@ -7934,7 +8081,7 @@ def _eclipseinit_project(p, files=None, libFiles=None):
         if not genDir.startswith(p.dir):
             genDirName = basename(genDir)
             out.open('classpathentry', {'kind' : 'src', 'path' : genDirName})
-            linkedResources.append(EclipseLinkedResource(genDirName, '2', genDir))
+            linkedResources.append(_eclipse_linked_resource(genDirName, '2', genDir))
         else:
             out.open('classpathentry', {'kind' : 'src', 'path' : p.source_gen_dir(relative=True)})
 
@@ -8011,7 +8158,7 @@ def _eclipseinit_project(p, files=None, libFiles=None):
     if outputDirRel.startswith('..'):
         outputDirName = basename(outputDirRel)
         out.element('classpathentry', {'kind' : 'output', 'path' : outputDirName})
-        linkedResources.append(EclipseLinkedResource(outputDirName, '2', p.output_dir()))
+        linkedResources.append(_eclipse_linked_resource(outputDirName, '2', p.output_dir()))
     else:
         out.element('classpathentry', {'kind' : 'output', 'path' : outputDirRel})
     out.close('classpath')
@@ -8092,7 +8239,7 @@ def _eclipseinit_project(p, files=None, libFiles=None):
             out.open('link')
             out.element('name', data=lr.name)
             out.element('type', data=lr.type)
-            out.element('location', data=lr.location)
+            out.element('locationURI', data=get_eclipse_project_rel_locationURI(lr.location, p.dir))
             out.close('link')
         out.close('linkedResources')
     out.close('projectDescription')
@@ -8152,9 +8299,7 @@ def _eclipseinit_suite(args, suite, buildProcessorJars=True, refreshOnly=False):
         files += _processorjars_suite(suite)
 
     for p in suite.projects:
-        if not p.isJavaProject():
-            continue
-        _eclipseinit_project(p, files, libFiles)
+        p._eclipseinit(files, libFiles)
 
     _, launchFile = make_eclipse_attach(suite, 'localhost', '8000', deps=dependencies())
     files.append(launchFile)
@@ -8470,7 +8615,8 @@ def netbeansinit(args, refreshOnly=False, buildProcessorJars=True):
     for suite in suites(True):
         _netbeansinit_suite(args, suite, refreshOnly, buildProcessorJars)
 
-def _netbeansinit_project(p, jdks=None, files=None, libFiles=None):
+def _netbeansinit_project(p, jdks=None, files=None, libFiles=None, dists=None):
+    dists = [] if dists is None else dists
     ensure_dir_exists(join(p.dir, 'nbproject'))
 
     jdk = get_jdk(p.javaCompliance)
@@ -8522,8 +8668,11 @@ def _netbeansinit_project(p, jdks=None, files=None, libFiles=None):
     out.element('env', {'key' : 'JAVA_HOME', 'value' : jdk.home})
     out.element('arg', {'value' : os.path.abspath(__file__)})
     out.element('arg', {'value' : 'build'})
+    buildOnly = p.name
+    for d in dists:
+        buildOnly = buildOnly + ',' + d.name
     out.element('arg', {'value' : '--only'})
-    out.element('arg', {'value' : p.name})
+    out.element('arg', {'value' : buildOnly})
     out.element('arg', {'value' : '--force-javac'})
     out.element('arg', {'value' : '--no-native'})
     out.close('exec')
@@ -8806,8 +8955,8 @@ def _netbeansinit_suite(args, suite, refreshOnly=False, buildProcessorJars=True)
         if exists(join(p.dir, 'plugin.xml')):  # eclipse plugin project
             continue
 
-        _netbeansinit_project(p, jdks, files, libFiles)
-
+        includedInDists = [d for d in suite.dists if p in d.archived_deps()]
+        _netbeansinit_project(p, jdks, files, libFiles, includedInDists)
     log('If using NetBeans:')
     # http://stackoverflow.com/questions/24720665/cant-resolve-jdk-internal-package
     log('  1. Edit etc/netbeans.conf in your NetBeans installation and modify netbeans_default_options variable to include "-J-DCachingArchiveProvider.disableCtSym=true"')
@@ -9078,6 +9227,26 @@ def fsckprojects(args):
                             shutil.rmtree(dirpath)
                             log('Deleted ' + dirpath)
 
+def find_packages(project, pkgs=None, onlyPublic=True, packages=None, exclude_packages=None):
+    packages = [] if packages is None else packages
+    exclude_packages = [] if exclude_packages is None else exclude_packages
+    sourceDirs = project.source_dirs()
+    def is_visible(name):
+        if onlyPublic:
+            return name == 'package-info.java'
+        else:
+            return name.endswith('.java')
+    if pkgs is None:
+        pkgs = set()
+    for sourceDir in sourceDirs:
+        for root, _, files in os.walk(sourceDir):
+            if len([name for name in files if is_visible(name)]) != 0:
+                pkg = root[len(sourceDir) + 1:].replace(os.sep, '.')
+                if len(packages) == 0 or pkg in packages:
+                    if len(exclude_packages) == 0 or not pkg in exclude_packages:
+                        pkgs.add(pkg)
+    return pkgs
+
 def javadoc(args, parser=None, docDir='javadoc', includeDeps=True, stdDoclet=True):
     """generate javadoc for some/all Java projects"""
 
@@ -9136,23 +9305,6 @@ def javadoc(args, parser=None, docDir='javadoc', includeDeps=True, stdDoclet=Tru
                 logv('[package-list file exists - skipping {0}]'.format(p.name))
 
 
-    def find_packages(sourceDirs, pkgs=None, impl=False):
-        def is_visible(name):
-            if impl:
-                return name.endswith('.java')
-            else:
-                return name == 'package-info.java'
-        if pkgs is None:
-            pkgs = set()
-        for sourceDir in sourceDirs:
-            for root, _, files in os.walk(sourceDir):
-                if len([name for name in files if is_visible(name)]) != 0:
-                    pkg = root[len(sourceDir) + 1:].replace(os.sep, '.')
-                    if len(packages) == 0 or pkg in packages:
-                        if len(exclude_packages) == 0 or not pkg in exclude_packages:
-                            pkgs.add(pkg)
-        return pkgs
-
     extraArgs = [a.lstrip('@') for a in args.extra_args]
     if args.argfile is not None:
         extraArgs += ['@' + args.argfile]
@@ -9165,7 +9317,7 @@ def javadoc(args, parser=None, docDir='javadoc', includeDeps=True, stdDoclet=Tru
     build(['--no-native', '--dependencies', ','.join((p.name for p in projects))])
     if not args.unified:
         for p in projects:
-            pkgs = find_packages(p.source_dirs(), set(), args.implementation)
+            pkgs = find_packages(p, set(), False, packages, exclude_packages)
             jdk = get_jdk(p.javaCompliance)
             links = ['-linkoffline', 'http://docs.oracle.com/javase/' + str(jdk.javaCompliance.value) + '/docs/api/', _mx_home + '/javadoc/jdk']
             out = outDir(p)
@@ -9226,7 +9378,7 @@ def javadoc(args, parser=None, docDir='javadoc', includeDeps=True, stdDoclet=Tru
         sproots = []
         names = []
         for p in projects:
-            find_packages(p.source_dirs(), pkgs, args.implementation)
+            find_packages(p, pkgs, not args.implementation, packages, exclude_packages)
             sproots += p.source_dirs()
             names.append(p.name)
 
@@ -9475,53 +9627,67 @@ def sclone(args):
     _dst_suitemodel.set_primary_dir(dest)
     _src_suitemodel.set_primary_dir(source)
 
-    _sclone(source, dest, None, args.no_imports, args.kind)
+    _sclone(source, dest, None, args.no_imports, args.kind, primary=True)
 
-def _sclone(source, dest, suite_import, no_imports=False, vc_kind=None):
+def _sclone(source, dest, suite_import, no_imports=False, vc_kind=None, manual=False, primary=False):
     rev = suite_import.version if suite_import is not None and suite_import.version is not None else None
     url_vcs = SuiteImport.get_source_urls(source, vc_kind)
+    if manual:
+        assert len(url_vcs) > 0
+        log("Clone {} at revision {} into {}".format(' or '.join((url_vc.url for url_vc in url_vcs)), rev if rev else 'tip', dest))
+        return None
     for url_vc in url_vcs:
         if url_vc.vc.clone(url_vc.url, rev=rev, dest=dest):
             break
 
+    if not exists(dest):
+        if len(url_vcs) == 0:
+            reason = 'no url provided'
+            if suite_import.dynamicImport:
+                reason += ' for dynamic import. Dynamically imported suites should be cloned first (clone {} to {})'.format(suite_import.name, dest)
+        else:
+            reason = 'none of the urls worked'
+        warn("Could not clone {}: {}".format(suite_import.name, reason))
+        return None
+
     mxDir = _is_suite_dir(dest)
     if mxDir is None:
-        warn(source + ' is not an mx suite')
+        warn(dest + ' is not an mx suite')
         return None
 
     # create a Suite (without loading) to enable imports visitor
-    s = SourceSuite(mxDir, load=False)
+    s = SourceSuite(mxDir, load=False, dynamicallyImported=suite_import.dynamicImport if suite_import else False, primary=primary)
     if not no_imports:
-        s.visit_imports(_scloneimports_visitor, source=dest)
+        s.visit_imports(_scloneimports_visitor, source=dest, manual=manual)
     return s
 
-def _scloneimports_visitor(s, suite_import, source, **extra_args):
+def _scloneimports_visitor(s, suite_import, source, manual=False, **extra_args):
     """
     cloneimports visitor for Suite.visit_imports.
     The destination information is encapsulated by 's'
     """
-    _scloneimports(s, suite_import, source)
+    _scloneimports(s, suite_import, source, manual)
 
-def _scloneimports_suitehelper(sdir):
+def _scloneimports_suitehelper(sdir, primary=False, dynamicallyImported=False):
     mxDir = _is_suite_dir(sdir)
     if mxDir is None:
         abort(sdir + ' is not an mx suite')
     else:
         # create a Suite (without loading) to enable imports visitor
-        return SourceSuite(mxDir, load=False)
+        return SourceSuite(mxDir, primary=primary, load=False, dynamicallyImported=dynamicallyImported)
 
-def _scloneimports(s, suite_import, source):
+def _scloneimports(s, suite_import, source, manual=False):
     # clone first, then visit imports once we can locate them
     importee_source = _src_suitemodel.importee_dir(source, suite_import)
     importee_dest = _dst_suitemodel.importee_dir(s.dir, suite_import)
     if exists(importee_dest):
         # already exists in the suite model, but may be wrong version
-        importee_suite = _scloneimports_suitehelper(importee_dest)
-        if suite_import.version is not None and importee_suite.version() != suite_import.version:
+        importee_suite = _scloneimports_suitehelper(importee_dest, dynamicallyImported=suite_import.dynamicImport)
+        if not suite_import.dynamicImport and suite_import.version is not None and importee_suite.version() != suite_import.version:
             abort("imported version of " + suite_import.name + " in " + s.name + " does not match the version in already existing suite: " + importee_suite.dir)
-        importee_suite.visit_imports(_scloneimports_visitor, source=importee_source)
+        importee_suite.visit_imports(_scloneimports_visitor, source=importee_source, manual=manual)
     else:
-        _sclone(importee_source, importee_dest, suite_import)
+        _sclone(importee_source, importee_dest, suite_import, manual=manual)
         # _clone handles the recursive visit of the new imports
 
 @primary_suite_exempt
@@ -9529,6 +9695,7 @@ def scloneimports(args):
     """clone the imports of an existing suite"""
     parser = ArgumentParser(prog='mx scloneimports')
     parser.add_argument('--source', help='url/path of repo containing suite', metavar='<url>')
+    parser.add_argument('--manual', action='store_true', help='does not actually do the clones but prints the necessary clones')
     parser.add_argument('nonKWArgs', nargs=REMAINDER, metavar='source [dest]...')
     args = parser.parse_args(args)
     # check for non keyword args
@@ -9540,16 +9707,16 @@ def scloneimports(args):
     if not os.path.isdir(args.source):
         abort(args.source + ' is not a directory')
 
-    vcs = VC.get_vc(args.source)
-    s = _scloneimports_suitehelper(args.source)
+    source = os.path.realpath(args.source)
+    vcs = VC.get_vc(source)
+    s = _scloneimports_suitehelper(source, primary=True)
 
-    default_path = vcs.default_push(args.source)
+    default_path = vcs.default_push(source)
 
     # We can now set the primary directory for the dst suitemodel
     # N.B. source is effectively the destination and the default_path is the (original) source
-    _dst_suitemodel.set_primary_dir(args.source)
-
-    s.visit_imports(_scloneimports_visitor, source=default_path)
+    _dst_suitemodel.set_primary_dir(source)
+    s.visit_imports(_scloneimports_visitor, source=default_path, manual=args.manual)
 
 def _spush_import_visitor(s, suite_import, dest, checks, clonemissing, **extra_args):
     """push visitor for Suite.visit_imports"""
@@ -9694,26 +9861,36 @@ def _sforce_imports_visitor(s, suite_import, import_map, strict_versions, **extr
     _sforce_imports(s, suite(suite_import.name), suite_import, import_map, strict_versions)
 
 def _sforce_imports(importing_suite, imported_suite, suite_import, import_map, strict_versions):
+    suite_import_version = suite_import.version
     if imported_suite.name in import_map:
         # we have seen this already
-        if strict_versions:
-            if suite_import.version and import_map[imported_suite.name] != suite_import.version:
-                abort('inconsistent import versions for suite ' + imported_suite.name)
-        return
+        if not suite_import_version:
+            return
+        conflict_resolution = _opts.version_conflict_resolution
+        if conflict_resolution == 'suite':
+            conflict_resolution = importing_suite.versionConflictResolution
+        if conflict_resolution == 'latest':
+            suite_import_version = imported_suite.vc.latest(imported_suite.dir, import_map[imported_suite.name], suite_import_version)
+        elif strict_versions and import_map[imported_suite.name] != suite_import_version:
+            abort('inconsistent import versions for suite ' + imported_suite.name)
+        if import_map[imported_suite.name] != suite_import_version:
+            import_map[imported_suite.name] = suite_import_version
+        else:
+            return
     else:
-        import_map[imported_suite.name] = suite_import.version
+        import_map[imported_suite.name] = suite_import_version
 
-    if suite_import.version:
+    if suite_import_version:
         # normal case, a specific version
         importedVersion = imported_suite.version()
-        if importedVersion != suite_import.version:
+        if importedVersion != suite_import_version:
             if imported_suite.isDirty():
                 if is_interactive():
                     if not ask_yes_no('WARNING: Uncommited changes in {} will be lost! Really continue'.format(imported_suite.name), default='n'):
                         abort('aborting')
                 else:
                     abort('Uncommited changes in {}, aborting.'.format(imported_suite.name))
-            imported_suite.vc.update(imported_suite.dir, suite_import.version, mayPull=True, clean=True)
+            imported_suite.vc.update(imported_suite.dir, suite_import_version, mayPull=True, clean=True)
     else:
         # unusual case, no version specified, so pull the head
         imported_suite.vc.pull(imported_suite.dir, update=True)
@@ -10064,8 +10241,9 @@ def show_suites(args):
       --licenses   show element licenses
     """
     parser = ArgumentParser(prog='mx suites')
-    parser.add_argument('--locations', action='store_true', help='show element locations on disk')
-    parser.add_argument('--licenses', action='store_true', help='show element licenses')
+    parser.add_argument('-p', '--locations', action='store_true', help='show element locations on disk')
+    parser.add_argument('-l', '--licenses', action='store_true', help='show element licenses')
+    parser.add_argument('-a', '--archived-deps', action='store_true', help='show archived deps for distributions')
     args = parser.parse_args(args)
     def _location(e):
         if args.locations:
@@ -10096,6 +10274,9 @@ def show_suites(args):
                 if data:
                     out += ' (' + ', '.join(data) + ')'
                 log(out)
+                if name == 'distributions' and args.archived_deps:
+                    for a in e.archived_deps():
+                        log('      ' + a.name)
 
     for s in suites(True):
         location = _location(s)
@@ -10111,7 +10292,7 @@ def show_suites(args):
 
 def _compile_mx_class(javaClassName, classpath=None, jdk=None, myDir=None):
     myDir = _mx_home if myDir is None else myDir
-    binDir = join(myDir, 'bin' if not jdk else '.jdk' + str(jdk.version))
+    binDir = join(_mx_suite.get_output_root(), 'bin' if not jdk else '.jdk' + str(jdk.version))
     javaSource = join(myDir, javaClassName + '.java')
     javaClass = join(binDir, javaClassName + '.class')
     if not exists(javaClass) or getmtime(javaClass) < getmtime(javaSource):
@@ -10334,7 +10515,10 @@ def junit(args, harness=_basic_junit_harness, parser=None):
         # However, perhaps because it's Friday 13th javac is not actually compiling
         # this file, yet not returning error. It is perhaps related to annotation processors
         # so the workaround is to extract the junit path as that is all we need.
-        junitpath = [s for s in projectscp.split(":") if "junit" in s][0]
+        junitpath = [s for s in projectscp.split(":") if "junit" in s]
+        if len(junitpath) is 0:
+            junitpath = [s for s in projectscp.split(":") if "JUNIT" in s]
+        junitpath = junitpath[0]
 
         _, binDir = _compile_mx_class('MX2JUnitWrapper', junitpath)
 
@@ -10545,6 +10729,7 @@ _commands = {
     'checkheaders': [mx_gate.checkheaders, ''],
     'checkoverlap': [checkoverlap, ''],
     'checkstyle': [checkstyle, ''],
+    'sigtest': [mx_sigtest.sigtest, ''],
     'clean': [clean, ''],
     'eclipseinit': [eclipseinit, ''],
     'eclipseformat': [eclipseformat, ''],
@@ -10612,17 +10797,21 @@ def _mx_binary_distribution_version(name):
 def _suitename(mxDir):
     base = os.path.basename(mxDir)
     parts = base.split('.')
-    assert len(parts) == 2
+    if len(parts) == 3:
+        assert parts[0] == ''
+        assert parts[1] == 'mx'
+        return parts[2]
+    assert len(parts) == 2, parts
     assert parts[0] == 'mx'
     return parts[1]
 
 def _is_suite_dir(d, mxDirName=None):
     """
     Checks if d contains a suite.
-    If mxDirName is None, matches any suite name, otherwise checks for exactly 'mx.mxDirName'.
+    If mxDirName is None, matches any suite name, otherwise checks for exactly *mxDirName* or '.' + *mxDirName*.
     """
     if os.path.isdir(d):
-        for f in [mxDirName] if mxDirName else [e for e in os.listdir(d) if e.startswith('mx.')]:
+        for f in [mxDirName, '.' + mxDirName] if mxDirName else [e for e in os.listdir(d) if e.startswith('mx.') or e.startswith('.mx.')]:
             mxDir = join(d, f)
             if exists(mxDir) and isdir(mxDir) and (exists(join(mxDir, 'suite.py'))):
                 return mxDir
@@ -10883,7 +11072,7 @@ def main():
         # no need to show the stack trace when the user presses CTRL-C
         abort(1)
 
-version = VersionSpec("5.5.6")
+version = VersionSpec("5.5.12")
 
 currentUmask = None
 
