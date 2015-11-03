@@ -2925,7 +2925,7 @@ class GitConfig(VC):
 
     def is_this_vc(self, vcdir):
         gitDir = join(vcdir, self.metadir())
-        return os.path.isdir(gitDir)
+        return os.path.exists(gitDir)
 
     def metadir(self):
         return '.git'
