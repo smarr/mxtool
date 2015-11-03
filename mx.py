@@ -120,6 +120,12 @@ _distTemplates = dict()
 _licenses = dict()
 _repositories = dict()
 
+"""
+Map from the name of a removed dependency to the reason it was removed.
+A reason may be the name of another removed dependency, forming a causality chain.
+"""
+_removedDeps = {}
+
 _suites = dict()
 _loadedSuites = []
 
@@ -1231,7 +1237,9 @@ class JavaProject(Project, ClasspathDependency):
         Project.__init__(self, suite, name, subDir, srcDirs, deps, workingSets, d, theLicense)
         ClasspathDependency.__init__(self)
         self.checkstyleProj = name
-        self.javaCompliance = JavaCompliance(javaCompliance) if javaCompliance is not None else None
+        if javaCompliance is None:
+            abort('javaCompliance property required for Java project ' + name)
+        self.javaCompliance = JavaCompliance(javaCompliance)
         # The annotation processors defined by this project
         self.definedAnnotationProcessors = None
         self.declaredAnnotationProcessors = []
@@ -1517,7 +1525,7 @@ class JavaProject(Project, ClasspathDependency):
         _eclipseinit_project(self, files=files, libFiles=libFiles)
 
     def getBuildTask(self, args):
-        requiredCompliance = self.javaCompliance if self.javaCompliance else JavaCompliance(args.compliance) if args.compliance else None
+        requiredCompliance = self.javaCompliance
         if hasattr(args, 'javac_crosscompile') and args.javac_crosscompile:
             jdk = get_jdk() # build using default JDK
             if hasattr(args, 'parallelize') and args.parallelize:
@@ -1525,6 +1533,14 @@ class JavaProject(Project, ClasspathDependency):
                 get_jdk(requiredCompliance).bootclasspath()
         else:
             jdk = get_jdk(requiredCompliance)
+
+        if hasattr(args, "jdt") and args.jdt and not args.force_javac:
+            ec = _convert_to_eclipse_supported_compliance(max(jdk.javaCompliance, requiredCompliance))
+            if ec < jdk.javaCompliance:
+                jdk = get_jdk(versionCheck=ec.exactMatch, versionDescription=str(ec))
+            if ec < requiredCompliance:
+                requiredCompliance = ec
+
         return JavaBuildTask(args, self, jdk, requiredCompliance)
 
 class JavaBuildTask(ProjectBuildTask):
@@ -1743,6 +1759,9 @@ class JavacLikeCompiler(JavaCompiler):
         self.tmpFiles = []
         self.extraJavacArgs = extraJavacArgs if extraJavacArgs else []
 
+    def _get_compliance_jdk(self, compliance):
+        return get_jdk(compliance)
+
     def build(self, sourceFiles, project, jdk, compliance, outputDir, classPath, processorPath, sourceGenDir,
         disableApiRestrictions, warningsAsErrors, showTasks):
         jvmArgs = ['-Xmx1500m']
@@ -1755,11 +1774,11 @@ class JavacLikeCompiler(JavaCompiler):
         if jdk.javaCompliance != compliance:
             # cross-compilation
             assert jdk.javaCompliance > compliance
-            complianceJdk = get_jdk(compliance)
+            complianceJdk = self._get_compliance_jdk(compliance)
             # complianceJdk.javaCompliance could be different from compliance
             # because of non-strict compliance mode
             if jdk.javaCompliance != complianceJdk.javaCompliance:
-                javacArgs = get_jdk(compliance).javacLibOptions(javacArgs)
+                javacArgs = complianceJdk.javacLibOptions(javacArgs)
         if _opts.very_verbose:
             javacArgs.append('-verbose')
 
@@ -1833,6 +1852,16 @@ class ECJCompiler(JavacLikeCompiler):
     def name(self):
         return 'JDT'
 
+    def _get_compliance_jdk(self, compliance):
+        jdk = get_jdk(compliance)
+        esc = _convert_to_eclipse_supported_compliance(jdk.javaCompliance)
+        if esc < jdk.javaCompliance:
+            # We need to emulate strict compliance here so that the right boot
+            # class path is selected when compiling with a JDT that does not
+            # support a JDK9 boot class path
+            jdk = get_jdk(versionCheck=esc.exactMatch, versionDescription=str(esc))
+        return jdk
+
     def buildJavacLike(self, jdk, project, jvmArgs, javacArgs, disableApiRestrictions, warningsAsErrors, showTasks):
         jvmArgs += ['-jar', self.jdtJar]
         jdtArgs = javacArgs
@@ -1867,7 +1896,7 @@ class ECJCompiler(JavacLikeCompiler):
             else:
                 jdtArgs += ['-properties', _cygpathU2W(jdtProperties)]
 
-        run_java(jvmArgs + jdtArgs)
+        run_java(jvmArgs + jdtArgs, jdk=jdk)
 
 def is_debug_lib_file(fn):
     return fn.endswith(add_debug_lib_suffix(""))
@@ -2582,6 +2611,12 @@ class OutputCapture:
     def __call__(self, data):
         self.data += data
 
+class LinesOutputCapture:
+    def __init__(self):
+        self.lines = []
+    def __call__(self, data):
+        self.lines.append(data.rstrip())
+
 class HgConfig(VC):
     """
     Encapsulates access to Mercurial (hg)
@@ -2813,12 +2848,6 @@ class HgConfig(VC):
         return result
 
     def locate(self, vcdir, patterns=None, abortOnError=True):
-        class LinesOutputCapture:
-            def __init__(self):
-                self.lines = []
-            def __call__(self, data):
-                self.lines.append(data.rstrip())
-
         if patterns is None:
             patterns = []
         elif not isinstance(patterns, list):
@@ -2878,54 +2907,237 @@ class HgConfig(VC):
             return False
 
 
-class NotYetImplemented(Exception):
-    pass
-
-
 class GitConfig(VC):
     """
-    Encapsulates access to Mercurial (hg)
+    Encapsulates access to Git (git)
     """
     def __init__(self):
         VC.__init__(self, 'git', 'Git')
-        self._missing = 'no git executable found'
-        self._has_git = None
+        self.missing = 'no git executable found'
+        self.has_git = None
 
-    def check(self, abortOnError = True):
-        # Mercurial does lazy checking before use of the hg command itself
+    def check(self, abortOnError=True):
+        # Git does lazy checking before use of the git command itself
         return self
-
-    def _check_for_git(self, abortOnError=True):
-        # TODO: break this out into some hg/git common code!!
-        if self._has_git is None:
-            try:
-                subprocess.check_output(['git'])
-                self._has_git = True
-            except OSError:
-                self._has_git = False
-                warn(self._missing)
-
-        if not self._has_git:
-            if abortOnError:
-                abort(self._missing)
-            else:
-                warn(self._missing)
-
-        return self if self._has_git else None
-
-    def run(self, *args, **kwargs):
-        # Ensure hg exists before executing the command
-        self._check_for_git()
-        return run(*args, **kwargs)
 
     def init(self, vcdir, abortOnError=True):
         return self.run(['git', 'init'], cwd=vcdir, nonZeroIsFatal=abortOnError) == 0
 
     def is_this_vc(self, vcdir):
-        dir_ = join(vcdir, self.metadir())
-        return os.path.exists(dir_)
+        gitDir = join(vcdir, self.metadir())
+        return os.path.isdir(gitDir)
 
-    def hg_command(self, vcdir, args, abortOnError=False, quiet=False):
+    def metadir(self):
+        return '.git'
+
+    # SCM METHODS
+
+    def add(self, vcdir, path, abortOnError=True):
+        return self.run(['git', '-C', vcdir, 'add', path]) == 0
+
+    def commit(self, vcdir, msg, abortOnError=True):
+        return self.run(['git', '-C', vcdir, 'commit', '-m', msg]) == 0
+
+    def tip(self, vcdir, abortOnError=True):
+        self.check_for_git()
+        try:
+            return subprocess.check_output(['git', '-C', vcdir, 'rev-parse', 'HEAD'])
+        except subprocess.CalledProcessError:
+            if abortOnError:
+                abort('git tip failed')
+            else:
+                return None
+
+    def clone(self, url, dest=None, rev=None, abortOnError=True, **extra_args):
+        cmd = ['git', 'clone']
+        # check out different branch
+        if extra_args and 'branch' in extra_args:
+            cmd.append('--branch')
+            cmd.append(extra_args['branch'])
+
+        cmd.append(url) # from
+        if dest:
+            cmd.append(dest) # to
+        self._log_clone(url, dest, rev)
+        out = OutputCapture()
+        rc = self.run(cmd, nonZeroIsFatal=abortOnError, out=out)
+
+        # change revision
+        if rev and rc == 0:
+            rc = rc or self.update(dest, rev=rev, abortOnError=abortOnError)
+
+        logvv(out.data)
+        return rc == 0
+
+    def pull(self, vcdir, rev=None, update=False, abortOnError=True):
+        '''
+        Uses the semantics of the hg pull here, aka. fetch in git.
+        If update is set, git merge is executed afterwards (hg update)
+        '''
+        cmd = ['git', '-C', vcdir, 'fetch']
+        self._log_pull(vcdir, rev)
+        out = OutputCapture()
+        rc = self.run(cmd, nonZeroIsFatal=abortOnError, out=out)
+        logvv(out.data)
+
+        if update:
+            rc = rc or self.update(vcdir, rev=rev, abortOnError=abortOnError)
+
+        return rc == 0
+
+    def push(self, vcdir, dest=None, rev=None, abortOnError=False):
+        '''
+        Omits the --force flag, instead pushes to branch 'mx_push'
+        to avoid overriden the master branch.
+        '''
+        cmd = ['git', '-C', vcdir, 'push']
+        if dest:
+            cmd.append(dest)
+
+        if rev:
+            cmd.append(rev + ':mx_push')
+
+        self._log_push(vcdir, dest, rev)
+        out = OutputCapture()
+        rc = self.run(cmd, nonZeroIsFatal=abortOnError, out=out)
+        logvv(out.data)
+        return rc == 0
+
+    def update(self, vcdir, rev=None, mayPull=False, clean=False, abortOnError=False):
+        '''
+        Uses 'merge' if no rev is specified. This is the intended use, to update with new
+        changes. Nevertheless, if a 'rev' is specified we use checkout, as an 'rev'
+        older than the current HEAD of the local repository is expected.
+        '''
+        cmd = ['git', '-C', vcdir]
+        if not rev:
+            cmd += ['merge', 'HEAD']
+        else:
+            cmd.append('checkout')
+            if clean:
+                cmd.append('--force') # throws away uncommitted changes!!!
+            cmd.append(rev)
+
+        result = self.run(cmd, nonZeroIsFatal=abortOnError) == 0
+        if not result and mayPull and rev:
+            self.pull(vcdir, rev=rev, update=False, abortOnError=abortOnError)
+            result = self.update(vcdir, rev=rev, clean=clean, abortOnError=abortOnError)
+        return result
+
+    def incoming(self, vcdir, abortOnError=True):
+        return self._checkCommits(vcdir, incoming=True, abortOnError=abortOnError)
+
+
+    def outgoing(self, vcdir, dest=None, abortOnError=True):
+        '''
+        The current branch's target remote branch is taken.
+        '''
+        if dest and abortOnError:
+            abort('Specifying a destination is currently not supported.')
+
+        return self._checkCommits(vcdir, incoming=False, abortOnError=abortOnError)
+
+    # HELPER
+
+    def can_push(self, vcdir, strict=True, abortOnError=True):
+        out = OutputCapture()
+        rc = self.run(['git', '-C', vcdir, 'status', '-s'], nonZeroIsFatal=abortOnError, out=out)
+        if rc == 0:
+            output = out.data
+            if strict:
+                # no uncommitted / not added
+                return output == ''
+            else:
+                # we check for untracked files
+                if len(output) > 0:
+                    for line in output.split('\n'):
+                        if len(line) > 0 and not line.strip().startswith('?'):
+                            return False
+                return True
+        else:
+            return False
+
+    def default_push(self, vcdir, abortOnError=True):
+        return self._getRemoteName(vcdir, 'push', abortOnError=abortOnError)
+
+    def default_pull(self, vcdir, abortOnError=True):
+        return self._getRemoteName(vcdir, 'fetch', abortOnError=abortOnError)
+
+    def isDirty(self, vcdir, abortOnError=True):
+        self.check_for_git()
+        try:
+            return len(subprocess.check_output(['git', '-C', vcdir, 'status', '-s'])) > 0
+        except subprocess.CalledProcessError:
+            if abortOnError:
+                abort('failed to get status')
+            else:
+                return None
+
+    def locate(self, vcdir, patterns=None, abortOnError=True):
+        if patterns is None:
+            patterns = []
+        elif not isinstance(patterns, list):
+            patterns = [patterns]
+
+        out = LinesOutputCapture()
+        rc = self.run(['git', '-C', vcdir, 'ls-files'] + patterns, out=out, nonZeroIsFatal=False)
+        if rc == 1:
+            # git returns 1 if no matches were found
+            return []
+        elif rc == 0:
+            return [os.path.join(vcdir, l.rstrip()) for l in out.lines]
+        else:
+            if abortOnError:
+                abort('locate returned: ' + str(rc))
+            else:
+                return None
+
+    def _checkCommits(self, vcdir, incoming, abortOnError=True):
+        remote = self._getUpstream(vcdir, abortOnError=abortOnError)
+        if not remote:
+            if abortOnError:
+                abort('current branch has no remote repository specified')
+            else:
+                return None
+
+        rc = self.run(['git', '-C', vcdir, 'fetch', remote[0]])
+        if rc == 0:
+            check = remote[0] + '/' + remote[1]
+            check = '..' + check if incoming else check + '..'
+            print 'changes for {}'.format(check)
+            out = OutputCapture()
+            rc = rc or self.run(['git', '-C', vcdir, 'log', check], out=out)
+            return out.data if out.data != '' else 'no changes'
+
+        if rc != 0:
+            if abortOnError:
+                abort('incoming returned: ' + str(rc))
+            else:
+                return None
+
+    def run(self, *args, **kwargs):
+        # Ensure git exists before executing the command
+        self.check_for_git()
+        return run(*args, **kwargs)
+
+    def check_for_git(self, abortOnError=True):
+        if self.has_git is None:
+            try:
+                subprocess.check_output(['git', '--version'])
+                self.has_git = True
+            except OSError:
+                self.has_git = False
+                warn(self.missing)
+
+        if not self.has_git:
+            if abortOnError:
+                abort(self.missing)
+            else:
+                warn(self.missing)
+
+        return self if self.has_git else None
+
+    def git_command(self, vcdir, args, abortOnError=False, quiet=False):
         args = ['git', '-C', vcdir] + args
         if not quiet:
             print '{0}'.format(" ".join(args))
@@ -2938,67 +3150,51 @@ class GitConfig(VC):
                 abort(" ".join(args) + ' returned ' + str(rc))
             return None
 
-    def add(self, vcdir, path, abortOnError=True):
-        raise NotYetImplemented()
+    def _getRemoteName(self, vcdir, tpe, abortOnError=True):
+        branches = LinesOutputCapture()
+        self.run(['git', '-C', vcdir, 'branch', '-vv'], out=branches)
+        name = ''
+        for branch in branches.lines:
+            if branch.strip().startswith('*'): # current branch
+                m = re.search(ur'\[(\w+)/', branch)
+                if m:
+                    name = m.group(1).strip()
 
-    def commit(self, vcdir, msg, abortOnError=True):
-        raise NotYetImplemented()
+        remotes = LinesOutputCapture()
+        self.run(['git', 'remote', '-v'], out=remotes)
+        for remote in remotes.lines:
+            print remote
+            m = re.search(name + ur'\s+(.+) \(' + tpe + ur'\)', remote)
+            if m:
+                return m.group(1).strip()
 
-    def tip(self, vcdir, abortOnError=True):
-        self._check_for_git()
-        raise NotYetImplemented()
+        if abortOnError:
+            abort('no remotes found')
+        else:
+            return None
 
-    def parent(self, vcdir, abortOnError=True):
-        self._check_for_git()
-        raise NotYetImplemented()
+    def _getUpstream(self, vcdir, abortOnError=True):
+        branches = LinesOutputCapture()
+        self.run(['git', '-C', vcdir, 'branch', '-vv'], out=branches)
+        for branch in branches.lines:
+            m = re.search(ur'\*\s(\S+).+\[(\S+)\/(\S+)[:.+\]|\]].+', branch)
+            if m:
+                # local branch, remote name, remote branch
+                return (m.group(2), m.group(3))
+        return None # current branch has no upstream set
 
-    def release_version_from_tags(self, vcdir, prefix, snapshotSuffix='dev', abortOnError=True):
-        raise NotYetImplemented()
 
-    def metadir(self):
-        return '.git'
+    # Not yet implemented / applicable
 
-    def clone(self, url, dest=None, rev=None, abortOnError=True, **extra_args):
-        raise NotYetImplemented()
+    # def parent(self, vcdir, abortOnError=True):
 
-    def incoming(self, vcdir, abortOnError=True):
-        raise NotYetImplemented()
+    # def release_version_from_tags(self, vcdir, prefix, snapshotSuffix='dev', abortOnError=True):
 
-    def outgoing(self, vcdir, dest=None, abortOnError=True):
-        raise NotYetImplemented()
+    # def bookmark(self, vcdir, name, rev, abortOnError=True):
 
-    def pull(self, vcdir, rev=None, update=False, abortOnError=True):
-        raise NotYetImplemented()
+    # def latest(self, vcdir, rev1, rev2, abortOnError=True):
 
-    def can_push(self, vcdir, strict=True, abortOnError=True):
-        raise NotYetImplemented()
-
-    def _path(self, vcdir, name, abortOnError=True):
-        raise NotYetImplemented()
-
-    def default_push(self, vcdir, abortOnError=True):
-        raise NotYetImplemented()
-
-    def default_pull(self, vcdir, abortOnError=True):
-        raise NotYetImplemented()
-
-    def push(self, vcdir, dest=None, rev=None, abortOnError=False):
-        raise NotYetImplemented()
-
-    def update(self, vcdir, rev=None, mayPull=False, clean=False, abortOnError=False):
-        raise NotYetImplemented()
-
-    def locate(self, vcdir, patterns=None, abortOnError=True):
-        raise NotYetImplemented()
-
-    def isDirty(self, vcdir, abortOnError=True):
-        raise NotYetImplemented()
-
-    def bookmark(self, vcdir, name, rev, abortOnError=True):
-        raise NotYetImplemented()
-
-    def latest(self, vcdir, rev1, rev2, abortOnError=True):
-        raise NotYetImplemented()
+    # def exists(self, vcdir, rev):
 
 
 class BinaryVC(VC):
@@ -4251,6 +4447,10 @@ class Suite:
             subDir = attrs.pop('subDir', None)
             path = attrs.pop('path', defaultPath)
             sourcesPath = attrs.pop('sourcesPath', defaultSourcesPath)
+            if sourcesPath == "<unified>":
+                sourcesPath = path
+            elif sourcesPath == "<none>":
+                sourcesPath = None
             mainClass = attrs.pop('mainClass', None)
             distDeps = Suite._pop_list(attrs, 'distDependencies', context)
             javaCompliance = attrs.pop('javaCompliance', None)
@@ -4411,26 +4611,9 @@ class Suite:
                         for imported in otherImporter.suite_imports:
                             if imported.name == s.name:
                                 if imported.version != suite_import.version:
-                                    if suite_import.dynamicImport and not s.dynamicallyImported:
-                                        continue
-                                    conflict_resolution = _opts.version_conflict_resolution
-                                    if conflict_resolution == 'suite':
-                                        conflict_resolution = importing_suite.versionConflictResolution
-
-                                    if conflict_resolution == 'none':
-                                        abort("mismatched import versions on '{}' in '{}' ({}) and '{}' ({})".format(s.name, importing_suite.name, suite_import.version, otherImporter.name, imported.version))
-                                    elif conflict_resolution == 'ignore':
-                                        warn("mismatched import versions on '{}' in '{}' ({}) and '{}' ({})".format(s.name, importing_suite.name, suite_import.version, otherImporter.name, imported.version))
-                                    else:
-                                        assert conflict_resolution == 'latest'
-                                        if not isinstance(s, SourceSuite):
-                                            abort("mismatched import versions on '{}' in '{}' and '{}', 'latest' conflict resolution is only suported for source suites".format(s.name, importing_suite.name, otherImporter.name))
-                                        if not s.vc.exists(s.dir, rev=suite_import.version):
-                                            s.vc.pull(s.dir, rev=suite_import.version, update=False)
-                                        resolved = s.vc.latest(s.dir, suite_import.version, s.vc.parent(s.dir))
-                                        # TODO currently this only handles simple DAGs and it will always do an update assuming that the repo is at a version controlled by mx
-                                        if s.vc.parent(s.dir) != resolved:
-                                            s.vc.update(s.dir, rev=resolved)
+                                    resolved = _resolve_suite_version_conflict(s.name, s, imported.version, otherImporter, suite_import, importing_suite)
+                                    if resolved:
+                                        s.vc.update(s.dir, rev=resolved, mayPull=True)
                 return s
 
         searchMode = 'binary' if _binary_suites is not None and (len(_binary_suites) == 0 or suite_import.name in _binary_suites) else 'source'
@@ -4556,6 +4739,36 @@ class Suite:
         if exists(path):
             return 'In definition of suite {} in {}'.format(self.name, path)
         return None
+
+def _resolve_suite_version_conflict(suiteName, existingSuite, existingVersion, existingImporter, otherImport, otherImportingSuite):
+    if otherImport.dynamicImport and (not existingSuite or not existingSuite.dynamicallyImported):
+        return None
+    if not otherImport.version:
+        return None
+    conflict_resolution = _opts.version_conflict_resolution
+    if conflict_resolution == 'suite':
+        if otherImportingSuite:
+            conflict_resolution = otherImportingSuite.versionConflictResolution
+        else:
+            warn("Conflict resolution was set to 'suite' but importing suite is not available")
+
+    if conflict_resolution == 'ignore':
+        warn("mismatched import versions on '{}' in '{}' ({}) and '{}' ({})".format(suiteName, otherImportingSuite.name, otherImport.version, existingImporter.name if existingImporter else '?', existingVersion))
+        return None
+    elif conflict_resolution == 'latest':
+        if not existingSuite:
+            return None # can not resolve at the moment
+        if not isinstance(existingSuite, SourceSuite):
+            abort("mismatched import versions on '{}' in '{}' and '{}', 'latest' conflict resolution is only suported for source suites".format(suiteName, otherImportingSuite.name, existingImporter.name if existingImporter else '?'))
+        if not existingSuite.vc.exists(existingSuite.dir, rev=otherImport.version):
+            return otherImport.version
+        resolved = existingSuite.vc.latest(existingSuite.dir, otherImport.version, existingSuite.vc.parent(existingSuite.dir))
+        # TODO currently this only handles simple DAGs and it will always do an update assuming that the repo is at a version controlled by mx
+        if existingSuite.vc.parent(existingSuite.dir) == resolved:
+            return None
+        return resolved
+    if conflict_resolution == 'none':
+        abort("mismatched import versions on '{}' in '{}' ({}) and '{}' ({})".format(suiteName, otherImportingSuite.name, otherImport.version, existingImporter.name if existingImporter else '?', existingVersion))
 
 '''A source suite'''
 class SourceSuite(Suite):
@@ -5274,6 +5487,26 @@ def instantiateDistribution(templateName, args, fatalIfMissing=True, context=Non
     d.resolveDeps()
     return d
 
+def _get_reasons_dep_was_removed(name):
+    """
+    Gets the causality chain for the dependency named *name* being removed.
+    Returns None if no dependency named *name* was removed.
+    """
+    reason = _removedDeps.get(name)
+    if reason:
+        r = _get_reasons_dep_was_removed(reason)
+        if r:
+            return ['{} was removed because {} was removed'.format(name, reason)] + r
+        return [reason]
+    return None
+
+def _missing_dep_message(depName, depType):
+    msg = '{} named {} was not found'.format(depType, depName)
+    reasons = _get_reasons_dep_was_removed(depName)
+    if reasons:
+        msg += ':\n  ' + '\n  '.join(reasons)
+    return msg
+
 def distribution(name, fatalIfMissing=True, context=None):
     """
     Get the distribution for a given name. This will abort if the named distribution does
@@ -5282,7 +5515,7 @@ def distribution(name, fatalIfMissing=True, context=None):
     _, name = splitqualname(name)
     d = _dists.get(name)
     if d is None and fatalIfMissing:
-        abort('distribution named ' + name + ' not found', context=context)
+        abort(_missing_dep_message(name, 'distribution'), context=context)
     return d
 
 def dependency(name, fatalIfMissing=True, context=None):
@@ -5322,7 +5555,7 @@ def dependency(name, fatalIfMissing=True, context=None):
     if d is None and fatalIfMissing:
         if name in _opts.ignored_projects:
             abort('dependency named ' + name + ' is ignored', context=context)
-        abort('dependency named ' + name + ' not found', context=context)
+        abort(_missing_dep_message(name, 'dependency'), context=context)
     return d
 
 def project(name, fatalIfMissing=True, context=None):
@@ -5334,7 +5567,7 @@ def project(name, fatalIfMissing=True, context=None):
     if p is None and fatalIfMissing:
         if name in _opts.ignored_projects:
             abort('project named ' + name + ' is ignored', context=context)
-        abort('project named ' + name + ' not found', context=context)
+        abort(_missing_dep_message(name, 'project'), context=context)
     return p
 
 def library(name, fatalIfMissing=True, context=None):
@@ -5346,12 +5579,12 @@ def library(name, fatalIfMissing=True, context=None):
     if l is None and fatalIfMissing:
         if _projects.get(name):
             abort(name + ' is a project, not a library', context=context)
-        abort('library named ' + name + ' not found', context=context)
+        abort(_missing_dep_message(name, 'library'), context=context)
     return l
 
 def classpath_entries(names=None, includeSelf=True, preferProjects=False):
     if names is None:
-        roots = dependencies()
+        roots = set(dependencies())
     else:
         if isinstance(names, types.StringTypes):
             names = [names]
@@ -5360,12 +5593,14 @@ def classpath_entries(names=None, includeSelf=True, preferProjects=False):
         roots = [dependency(n) for n in names]
         invalid = [d for d in roots if not isinstance(d, ClasspathDependency)]
         if invalid:
-            abort('class path roots must be a project or a distribution: ' + str(invalid))
+            abort('class path roots must be classpath dependencies: ' + str(invalid))
 
     cpEntries = []
     def _preVisit(dst, edge):
         if not isinstance(dst, ClasspathDependency):
             return False
+        if dst in roots or dst.isLibrary():
+            return True
         if edge and edge.src.isJARDistribution() and edge.kind == DEP_STANDARD:
             preferDist = isinstance(edge.src.suite, BinarySuite) or not preferProjects
             return dst.isJARDistribution() if preferDist else dst.isProject()
@@ -5789,11 +6024,10 @@ def get_jdk(versionCheck=None, purpose=None, cancel=None, versionDescription=Non
     # 2. JDK specified by set_java_command_default_jdk_tag
     # 3. JDK selected by DEFAULT_JDK_TAG tag
 
-    jdkOpt = get_jdk_option()
-    if versionCheck is None and jdkOpt.compliance:
-        versionCheck, versionDescription = _convert_compliance_to_version_check(jdkOpt.compliance)
-
     if tag is None:
+        jdkOpt = get_jdk_option()
+        if versionCheck is None and jdkOpt.compliance:
+            versionCheck, versionDescription = _convert_compliance_to_version_check(jdkOpt.compliance)
         tag = jdkOpt.tag if jdkOpt.tag else DEFAULT_JDK_TAG
 
     defaultTag = tag == DEFAULT_JDK_TAG
@@ -5981,7 +6215,7 @@ def _find_jdk(versionCheck=None, versionDescription=None, purpose=None, cancel=N
         selected = _find_jdk_in_candidates([jdkLocation], versionCheck, warn=True)
         if not selected:
             assert versionDescription
-            log("Error: JDK at '" + jdkLocation + "' is not compatible with version " + versionDescription)
+            log("Error: No JDK found at '" + jdkLocation + "' compatible with version " + versionDescription)
 
     varName = 'JAVA_HOME' if isDefaultJdk else 'EXTRA_JAVA_HOMES'
     allowMultiple = not isDefaultJdk
@@ -6095,7 +6329,7 @@ def _filtered_jdk_configs(candidates, versionCheck, warn=False, source=None):
             if versionCheck(config.version):
                 filtered.append(config)
         except JDKConfigException as e:
-            if warn:
+            if warn and source:
                 log('Path in ' + source + "' is not pointing to a JDK (" + e.message + ")")
     return filtered
 
@@ -7308,7 +7542,7 @@ def _processorjars_suite(s):
 
 @primary_suite_exempt
 def pylint(args):
-    """run pylint (if available) over Python source files (found by 'hg locate' or by tree walk with -walk)"""
+    """run pylint (if available) over Python source files (found by '<vc> locate' or by tree walk with -walk)"""
 
     parser = ArgumentParser(prog='mx pylint')
     parser.add_argument('--walk', action='store_true', help='use tree walk find .py files')
@@ -7348,7 +7582,7 @@ def pylint(args):
 
     def findfiles_by_vc(pyfiles):
         for suite in suites(True, includeBinary=False):
-            files = suite.vc.locate(suite.dir, ['-f', '*.py'])
+            files = suite.vc.locate(suite.dir, ['*.py'])
             for pyfile in files:
                 if exists(pyfile):
                     pyfiles.append(pyfile)
@@ -7499,7 +7733,7 @@ def canonicalizeprojects(args):
                     if not pkg.startswith(p.name):
                         p.abort('package in {0} does not have prefix matching project name: {1}'.format(p, pkg))
 
-            ignoredDeps = set([d for d in p.deps if d.isProject()])
+            ignoredDeps = set([d for d in p.deps if d.isJavaProject()])
             for pkg in p.imported_java_packages():
                 for dep in p.deps:
                     if not dep.isProject():
@@ -7517,13 +7751,13 @@ def canonicalizeprojects(args):
                         candidates.add(d)
                 # Remove non-canonical candidates
                 for c in list(candidates):
-                    c.walk_deps(visit=lambda dep, edge: candidates.discard(dep) if dep.isProject() else None)
+                    c.walk_deps(visit=lambda dep, edge: candidates.discard(dep) if dep.isJavaProject() else None)
                 candidates = [d.name for d in candidates]
 
                 p.abort('{0} does not use any packages defined in these projects: {1}\nComputed project dependencies: {2}'.format(
                     p, ', '.join([d.name for d in ignoredDeps]), ','.join(candidates)))
 
-            excess = frozenset(p.deps) - set(p.canonical_deps())
+            excess = frozenset([d for d in p.deps if d.isJavaProject()]) - set(p.canonical_deps())
             if len(excess) != 0:
                 nonCanonical.append(p)
     if len(nonCanonical) != 0:
@@ -7842,7 +8076,7 @@ def projectgraph(args, suite=None):
             for dep in p.canonical_deps():
                 toIndex = nextToIndex.get(dep, 0)
                 nextToIndex[dep] = toIndex + 1
-                igv.element('edge', {'from' : ids[p.name], 'fromIndex' : str(fromIndex), 'to' : ids[dep], 'toIndex' : str(toIndex), 'label' : 'dependsOn'})
+                igv.element('edge', {'from' : ids[p.name], 'fromIndex' : str(fromIndex), 'to' : ids[dep.name], 'toIndex' : str(toIndex), 'label' : 'dependsOn'})
                 fromIndex = fromIndex + 1
         igv.close('edges')
         igv.close('graph')
@@ -8059,8 +8293,18 @@ def get_eclipse_project_rel_locationURI(path, eclipseProjectDir):
         return join('PARENT-{}-PROJECT_LOC'.format(parents), sep.join([n for n in names if n != '..']))
     return join('PROJECT_LOC', sep.join([n for n in names if n != '..']))
 
+def _convert_to_eclipse_supported_compliance(compliance):
+    """
+    Downgrades a given Java compliance to a level supported by Eclipse.
+    This accounts for the reality that Eclipse (and JDT) usually add support for JDK releases later
+    than javac support is available.
+    """
+    if compliance and compliance > "1.8":
+        return JavaCompliance("1.8")
+    return compliance
+
 def _eclipseinit_project(p, files=None, libFiles=None):
-    assert get_jdk(p.javaCompliance)
+    eclipseJavaCompliance = _convert_to_eclipse_supported_compliance(p.javaCompliance)
 
     ensure_dir_exists(p.dir)
 
@@ -8095,8 +8339,7 @@ def _eclipseinit_project(p, files=None, libFiles=None):
             files.append(genDir)
 
     # Every Java program depends on a JRE
-    jdk = get_jdk(p.javaCompliance)
-    out.element('classpathentry', {'kind' : 'con', 'path' : 'org.eclipse.jdt.launching.JRE_CONTAINER/org.eclipse.jdt.internal.debug.ui.launcher.StandardVMType/JavaSE-' + str(jdk.javaCompliance)})
+    out.element('classpathentry', {'kind' : 'con', 'path' : 'org.eclipse.jdt.launching.JRE_CONTAINER/org.eclipse.jdt.internal.debug.ui.launcher.StandardVMType/JavaSE-' + str(eclipseJavaCompliance)})
 
     if exists(join(p.dir, 'plugin.xml')):  # eclipse plugin project
         out.element('classpathentry', {'kind' : 'con', 'path' : 'org.eclipse.pde.core.requiredPlugins'})
@@ -8259,7 +8502,7 @@ def _eclipseinit_project(p, files=None, libFiles=None):
             print >> out, '# Source:', source
             with open(source) as f:
                 print >> out, f.read()
-        content = out.getvalue().replace('${javaCompliance}', str(p.javaCompliance))
+        content = out.getvalue().replace('${javaCompliance}', str(eclipseJavaCompliance))
         if processorPath:
             content = content.replace('org.eclipse.jdt.core.compiler.processAnnotations=disabled', 'org.eclipse.jdt.core.compiler.processAnnotations=enabled')
         update_file(join(settingsDir, name), content)
@@ -8330,7 +8573,7 @@ def _eclipseinit_suite(args, suite, buildProcessorJars=True, refreshOnly=False):
         out.close('projects')
         out.open('buildSpec')
         dist.dir = projectDir
-        javaCompliances = [p.javaCompliance for p in dist.archived_deps() if p.isProject()]
+        javaCompliances = [_convert_to_eclipse_supported_compliance(p.javaCompliance) for p in dist.archived_deps() if p.isProject()]
         if len(javaCompliances) > 0:
             dist.javaCompliance = max(javaCompliances)
         _genEclipseBuilder(out, dist, 'Create' + dist.name + 'Dist', '-v archive @' + dist.name, relevantResources=relevantResources, logToFile=True, refresh=False, async=False, logToConsole=False, appendToLogFile=False)
@@ -9597,6 +9840,7 @@ def sclone(args):
     parser.add_argument('--dest', help='destination directory (default basename of source)', metavar='<path>')
     parser.add_argument("--no-imports", action='store_true', help='do not clone imported suites')
     parser.add_argument("--kind", help='vc kind for URL suites', default='hg')
+    parser.add_argument('--ignore-version', action='store_true', help='ignore version mismatch for existing suites')
     parser.add_argument('nonKWArgs', nargs=REMAINDER, metavar='source [dest]...')
     args = parser.parse_args(args)
     # check for non keyword args
@@ -9627,14 +9871,23 @@ def sclone(args):
     _dst_suitemodel.set_primary_dir(dest)
     _src_suitemodel.set_primary_dir(source)
 
-    _sclone(source, dest, None, args.no_imports, args.kind, primary=True)
+    _sclone(source, dest, None, args.no_imports, args.kind, primary=True, ignoreVersion=args.ignore_version)
 
-def _sclone(source, dest, suite_import, no_imports=False, vc_kind=None, manual=False, primary=False):
+def _sclone(source, dest, suite_import, no_imports=False, vc_kind=None, manual=None, primary=False, ignoreVersion=False, importingSuite=None):
     rev = suite_import.version if suite_import is not None and suite_import.version is not None else None
     url_vcs = SuiteImport.get_source_urls(source, vc_kind)
-    if manual:
+    if manual is not None:
         assert len(url_vcs) > 0
-        log("Clone {} at revision {} into {}".format(' or '.join((url_vc.url for url_vc in url_vcs)), rev if rev else 'tip', dest))
+        revname = rev if rev else 'tip'
+        if suite_import.name in manual:
+            if manual[suite_import.name] == revname:
+                return None
+            resolved = _resolve_suite_version_conflict(suite_import.name, None, manual[suite_import.name], None, suite_import, importingSuite)
+            if not resolved:
+                return None
+            revname = resolved
+        log("Clone {} at revision {} into {}".format(' or '.join(("{} with {}".format(url_vc.url, url_vc.vc.kind) for url_vc in url_vcs)), revname, dest))
+        manual[suite_import.name] = revname
         return None
     for url_vc in url_vcs:
         if url_vc.vc.clone(url_vc.url, rev=rev, dest=dest):
@@ -9658,15 +9911,15 @@ def _sclone(source, dest, suite_import, no_imports=False, vc_kind=None, manual=F
     # create a Suite (without loading) to enable imports visitor
     s = SourceSuite(mxDir, load=False, dynamicallyImported=suite_import.dynamicImport if suite_import else False, primary=primary)
     if not no_imports:
-        s.visit_imports(_scloneimports_visitor, source=dest, manual=manual)
+        s.visit_imports(_scloneimports_visitor, source=dest, manual=manual, ignoreVersion=ignoreVersion)
     return s
 
-def _scloneimports_visitor(s, suite_import, source, manual=False, **extra_args):
+def _scloneimports_visitor(s, suite_import, source, manual=None, ignoreVersion=False, **extra_args):
     """
     cloneimports visitor for Suite.visit_imports.
     The destination information is encapsulated by 's'
     """
-    _scloneimports(s, suite_import, source, manual)
+    _scloneimports(s, suite_import, source, manual, ignoreVersion)
 
 def _scloneimports_suitehelper(sdir, primary=False, dynamicallyImported=False):
     mxDir = _is_suite_dir(sdir)
@@ -9676,18 +9929,27 @@ def _scloneimports_suitehelper(sdir, primary=False, dynamicallyImported=False):
         # create a Suite (without loading) to enable imports visitor
         return SourceSuite(mxDir, primary=primary, load=False, dynamicallyImported=dynamicallyImported)
 
-def _scloneimports(s, suite_import, source, manual=False):
+def _scloneimports(s, suite_import, source, manual=None, ignoreVersion=False):
     # clone first, then visit imports once we can locate them
     importee_source = _src_suitemodel.importee_dir(source, suite_import)
     importee_dest = _dst_suitemodel.importee_dir(s.dir, suite_import)
     if exists(importee_dest):
         # already exists in the suite model, but may be wrong version
         importee_suite = _scloneimports_suitehelper(importee_dest, dynamicallyImported=suite_import.dynamicImport)
-        if not suite_import.dynamicImport and suite_import.version is not None and importee_suite.version() != suite_import.version:
-            abort("imported version of " + suite_import.name + " in " + s.name + " does not match the version in already existing suite: " + importee_suite.dir)
-        importee_suite.visit_imports(_scloneimports_visitor, source=importee_source, manual=manual)
+        existingRevision = importee_suite.version()
+        if not ignoreVersion and existingRevision != suite_import.version:
+            resolved = _resolve_suite_version_conflict(suite_import.name, importee_suite, existingRevision, None, suite_import, s)
+            if resolved:
+                assert resolved != existingRevision
+                if manual:
+                    if suite_import.name not in manual or manual[suite_import.name] != resolved:
+                        log("Update {} to revision {} with {}".format(importee_dest, resolved, importee_suite.vc.kind))
+                        manual[suite_import.name] = resolved
+                else:
+                    importee_suite.vc.update(importee_dest, rev=resolved, mayPull=True)
+        importee_suite.visit_imports(_scloneimports_visitor, source=importee_dest, manual=manual, ignoreVersion=ignoreVersion)
     else:
-        _sclone(importee_source, importee_dest, suite_import, manual=manual)
+        _sclone(importee_source, importee_dest, suite_import, manual=manual, ignoreVersion=ignoreVersion, importingSuite=s)
         # _clone handles the recursive visit of the new imports
 
 @primary_suite_exempt
@@ -9696,6 +9958,7 @@ def scloneimports(args):
     parser = ArgumentParser(prog='mx scloneimports')
     parser.add_argument('--source', help='url/path of repo containing suite', metavar='<url>')
     parser.add_argument('--manual', action='store_true', help='does not actually do the clones but prints the necessary clones')
+    parser.add_argument('--ignore-version', action='store_true', help='ignore version mismatch for existing suites')
     parser.add_argument('nonKWArgs', nargs=REMAINDER, metavar='source [dest]...')
     args = parser.parse_args(args)
     # check for non keyword args
@@ -9716,7 +9979,7 @@ def scloneimports(args):
     # We can now set the primary directory for the dst suitemodel
     # N.B. source is effectively the destination and the default_path is the (original) source
     _dst_suitemodel.set_primary_dir(source)
-    s.visit_imports(_scloneimports_visitor, source=default_path, manual=args.manual)
+    s.visit_imports(_scloneimports_visitor, source=default_path, manual={} if args.manual else None, ignoreVersion=args.ignore_version)
 
 def _spush_import_visitor(s, suite_import, dest, checks, clonemissing, **extra_args):
     """push visitor for Suite.visit_imports"""
@@ -9864,19 +10127,10 @@ def _sforce_imports(importing_suite, imported_suite, suite_import, import_map, s
     suite_import_version = suite_import.version
     if imported_suite.name in import_map:
         # we have seen this already
-        if not suite_import_version:
+        resolved = _resolve_suite_version_conflict(imported_suite.name, imported_suite, import_map[imported_suite.name], None, suite_import, importing_suite)
+        if not resolved:
             return
-        conflict_resolution = _opts.version_conflict_resolution
-        if conflict_resolution == 'suite':
-            conflict_resolution = importing_suite.versionConflictResolution
-        if conflict_resolution == 'latest':
-            suite_import_version = imported_suite.vc.latest(imported_suite.dir, import_map[imported_suite.name], suite_import_version)
-        elif strict_versions and import_map[imported_suite.name] != suite_import_version:
-            abort('inconsistent import versions for suite ' + imported_suite.name)
-        if import_map[imported_suite.name] != suite_import_version:
-            import_map[imported_suite.name] = suite_import_version
-        else:
-            return
+        suite_import_version = resolved
     else:
         import_map[imported_suite.name] = suite_import_version
 
@@ -10892,13 +11146,16 @@ def _check_dependency_cycles():
     walk_deps(ignoredEdges=[DEP_EXCLUDED], preVisit=_preVisit, visitEdge=_visitEdge, visit=_visit)
 
 def _remove_unsatisfied_deps():
-    '''Remove projects and libraries that (recursively) depend on an optional library
+    '''
+    Remove projects and libraries that (recursively) depend on an optional library
     whose artifact does not exist or on a JRE library that is not present in the
     JDK for a project. Also remove projects whose Java compliance requirement
-    cannot be satisfied by the configured JDKs.
-    Removed projects and libraries are also removed from
-    distributions in they are listed as dependencies.'''
-    omittedDeps = set()
+    cannot be satisfied by the configured JDKs. Removed projects and libraries are
+    also removed from distributions in which they are listed as dependencies.
+    Returns a map from the name of a removed dependency to the reason it was removed.
+    A reason may be the name of another removed dependency.
+    '''
+    removedDeps = {}
     def visit(dep, edge):
         if dep.isLibrary():
             if dep.optional:
@@ -10910,36 +11167,45 @@ def _remove_unsatisfied_deps():
                 finally:
                     dep.optional = True
                 if not path:
-                    logv('[omitting optional library {0} as {1} does not exist]'.format(dep, dep.path))
-                    omittedDeps.add(dep)
+                    reason = 'optional library {} was removed as {} does not exist'.format(dep, dep.path)
+                    logv('[' + reason + ']')
+                    removedDeps[dep] = reason
         elif dep.isJavaProject():
             # TODO this lookup should be the same as the one used in build
-            depJdk = get_jdk(dep.javaCompliance, cancel='some projects will be omitted which may result in errors', purpose="building projects with compliance " + str(dep.javaCompliance), tag=DEFAULT_JDK_TAG)
+            depJdk = get_jdk(dep.javaCompliance, cancel='some projects will be removed which may result in errors', purpose="building projects with compliance " + str(dep.javaCompliance), tag=DEFAULT_JDK_TAG)
             if depJdk is None:
-                logv('[omitting project {0} as Java compliance {1} cannot be satisfied by configured JDKs]'.format(dep, dep.javaCompliance))
-                omittedDeps.add(dep)
+                reason = 'project {0} was removed as Java compliance {1} cannot be satisfied by configured JDKs'.format(dep, dep.javaCompliance)
+                logv('[' + reason + ']')
+                removedDeps[dep] = reason
             else:
                 for depDep in list(dep.deps):
-                    if depDep.isJreLibrary() or depDep.isJdkLibrary():
+                    if depDep in removedDeps:
+                        logv('[removed {} because {} was removed]'.format(dep, depDep))
+                        removedDeps[dep] = depDep.name
+                    elif depDep.isJreLibrary() or depDep.isJdkLibrary():
                         lib = depDep
                         if not lib.is_present_in_jdk(depJdk):
-                            if depDep.optional:
-                                logv('[omitting project {} as dependency {} is missing]'.format(dep, lib))
-                                omittedDeps.add(dep)
+                            if lib.optional:
+                                reason = 'project {} was removed as dependency {} is missing'.format(dep, lib)
+                                logv('[' + reason + ']')
+                                removedDeps[dep] = reason
                             else:
                                 abort('JRE/JDK library {} required by {} not found'.format(lib, dep), context=dep)
         elif dep.isDistribution():
             dist = dep
             for distDep in list(dist.deps):
-                if distDep in omittedDeps:
-                    logv('[omitting {0} from distribution {1}]'.format(distDep, dist))
+                if distDep in removedDeps:
+                    logv('[{0} was removed from distribution {1}]'.format(distDep, dist))
                     dist.deps.remove(distDep)
 
     walk_deps(visit=visit)
 
-    for dep in omittedDeps:
+    res = {}
+    for dep, reason in removedDeps.iteritems():
+        res[dep.name] = reason
         dep.getSuiteRegistry().remove(dep)
         dep.getGlobalRegistry().pop(dep.name)
+    return res
 
 def _get_command_property(command, propertyName):
     c = _commands.get(command)
@@ -11047,7 +11313,8 @@ def main():
 
     if primarySuiteMxDir and not vc_command:
         if not _get_command_property(command, "keepUnsatisfiedDependencies"):
-            _remove_unsatisfied_deps()
+            global _removedDeps
+            _removedDeps = _remove_unsatisfied_deps()
 
     def term_handler(signum, frame):
         abort(1)
@@ -11072,7 +11339,7 @@ def main():
         # no need to show the stack trace when the user presses CTRL-C
         abort(1)
 
-version = VersionSpec("5.5.12")
+version = VersionSpec("5.5.14")
 
 currentUmask = None
 
