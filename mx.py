@@ -147,6 +147,9 @@ _mvn = None
 _binary_suites = None # source suites only if None, [] means all binary, otherwise specific list
 _suites_ignore_versions = None # as per _binary_suites, ignore versions on clone
 
+# List of functions to run when the primary suite is initialized
+_primary_suite_deferrables = []
+
 def nyi(name, obj):
     abort('{} is not implemented for {}'.format(name, obj.__class__.__name__))
 
@@ -1151,7 +1154,13 @@ class Project(Dependency):
         Gets the root of the directory hierarchy under which generated artifacts for this
         project such as class files and annotation generated sources should be placed.
         '''
-        return join(self.suite.get_output_root(), self.name) if not self.subDir else join(self.suite.get_output_root(), self.subDir, self.name)
+        if not self.subDir:
+            return join(self.suite.get_output_root(), self.name)
+        names = self.subDir.split(os.sep)
+        parents = len([n for n in names if n == '..'])
+        if parents != 0:
+            return os.sep.join([self.suite.get_output_root(), '{}-parent-{}'.format(self.suite, parents)] + names[parents:] + [self.name])
+        return join(self.suite.get_output_root(), self.subDir, self.name)
 
     def _walk_deps_visit_edges(self, visited, edge, preVisit=None, visit=None, ignoredEdges=None, visitEdge=None):
         if not _is_edge_ignored(DEP_STANDARD, ignoredEdges):
@@ -1528,6 +1537,8 @@ class JavaProject(Project, ClasspathDependency):
         requiredCompliance = self.javaCompliance
         if hasattr(args, 'javac_crosscompile') and args.javac_crosscompile:
             jdk = get_jdk() # build using default JDK
+            if jdk.javaCompliance < requiredCompliance:
+                jdk = get_jdk(requiredCompliance)
             if hasattr(args, 'parallelize') and args.parallelize:
                 # Best to initialize class paths on main process
                 get_jdk(requiredCompliance).bootclasspath()
@@ -1771,6 +1782,7 @@ class JavacLikeCompiler(JavaCompiler):
             javacArgs += ['-processorpath', processorPath, '-s', sourceGenDir]
         else:
             javacArgs += ['-proc:none']
+        hybridCrossCompilation = False
         if jdk.javaCompliance != compliance:
             # cross-compilation
             assert jdk.javaCompliance > compliance
@@ -1779,6 +1791,8 @@ class JavacLikeCompiler(JavaCompiler):
             # because of non-strict compliance mode
             if jdk.javaCompliance != complianceJdk.javaCompliance:
                 javacArgs = complianceJdk.javacLibOptions(javacArgs)
+            else:
+                hybridCrossCompilation = True
         if _opts.very_verbose:
             javacArgs.append('-verbose')
 
@@ -1786,7 +1800,7 @@ class JavacLikeCompiler(JavaCompiler):
         fileListFile = self.createFileListFile(sourceFiles, project.get_output_root())
         javacArgs.append('@' + _cygpathU2W(fileListFile))
         try:
-            self.buildJavacLike(jdk, project, jvmArgs, javacArgs, disableApiRestrictions, warningsAsErrors, showTasks)
+            self.buildJavacLike(jdk, project, jvmArgs, javacArgs, disableApiRestrictions, warningsAsErrors, showTasks, hybridCrossCompilation)
         finally:
             # Do not clean up temp files if verbose as there's
             # a good chance the user wants to copy and paste the
@@ -1795,7 +1809,11 @@ class JavacLikeCompiler(JavaCompiler):
                 for n in self.tmpFiles:
                     os.remove(n)
 
-    def buildJavacLike(self, jdk, project, jvmArgs, javacArgs, disableApiRestrictions, warningsAsErrors, showTasks):
+    def buildJavacLike(self, jdk, project, jvmArgs, javacArgs, disableApiRestrictions, warningsAsErrors, showTasks, hybridCrossCompilation):
+        """
+        *hybridCrossCompilation* is true if the -source compilation option denotes a different JDK version than
+        the JDK libraries that will be compiled against.
+        """
         nyi('buildJavacLike', self)
 
     def createFileListFile(self, files, directory):
@@ -1819,7 +1837,7 @@ class JavacCompiler(JavacLikeCompiler):
     def name(self):
         return 'javac'
 
-    def buildJavacLike(self, jdk, project, jvmArgs, javacArgs, disableApiRestrictions, warningsAsErrors, showTasks):
+    def buildJavacLike(self, jdk, project, jvmArgs, javacArgs, disableApiRestrictions, warningsAsErrors, showTasks, hybridCrossCompilation):
         lint = ['all', '-auxiliaryclass', '-processing']
         overrides = project.get_javac_lint_overrides()
         if overrides:
@@ -1827,8 +1845,15 @@ class JavacCompiler(JavacLikeCompiler):
                 lint = ['none']
             else:
                 lint += overrides
+        if hybridCrossCompilation:
+            if lint != ['none'] and warningsAsErrors:
+                # disable the "bootstrap class path not set in conjunction with -source N" warning
+                # since we are not in strict compliance mode
+                assert not _opts.strict_compliance
+                lint += ['-options']
         knownLints = jdk.getKnownJavacLints()
-        lint = [l for l in lint if l in knownLints]
+        if knownLints:
+            lint = [l for l in lint if l in knownLints]
         if lint:
             javacArgs.append('-Xlint:' + ','.join(lint))
         if disableApiRestrictions:
@@ -1862,7 +1887,7 @@ class ECJCompiler(JavacLikeCompiler):
             jdk = get_jdk(versionCheck=esc.exactMatch, versionDescription=str(esc))
         return jdk
 
-    def buildJavacLike(self, jdk, project, jvmArgs, javacArgs, disableApiRestrictions, warningsAsErrors, showTasks):
+    def buildJavacLike(self, jdk, project, jvmArgs, javacArgs, disableApiRestrictions, warningsAsErrors, showTasks, hybridCrossCompilation):
         jvmArgs += ['-jar', self.jdtJar]
         jdtArgs = javacArgs
 
@@ -2163,6 +2188,30 @@ class BaseLibrary(Dependency):
         # do not use suite's default license
         if licenseId:
             self.theLicense = get_license(licenseId, context=self)
+
+"""
+A library that is just a resource and therefore not a ClasspathDependency
+"""
+class ResourceLibrary(BaseLibrary):
+    def __init__(self, suite, name, path, optional, urls, sha1):
+        BaseLibrary.__init__(self, suite, name, optional, None)
+        self.path = path.replace('/', os.sep)
+        self.sourcePath = None
+        self.urls = urls
+        self.sha1 = sha1
+
+    def getBuildTask(self, args):
+        return LibraryDownloadTask(args, self)
+
+    def get_path(self, resolve):
+        path = _make_absolute(self.path, self.suite.dir)
+        sha1path = path + '.sha1'
+        return download_file_with_sha1(self.name, path, self.urls, self.sha1, sha1path, resolve, not self.optional, canSymlink=True)
+
+    def _check_download_needed(self):
+        path = _make_absolute(self.path, self.suite.dir)
+        sha1path = path + '.sha1'
+        return not _check_file_with_sha1(path, self.sha1, sha1path)
 
 """
 A library that will be provided by the JRE but may be absent.
@@ -2709,25 +2758,32 @@ class HgConfig(VC):
     def release_version_from_tags(self, vcdir, prefix, snapshotSuffix='dev', abortOnError=True):
         prefix = prefix + '-'
         try:
-            tags = [x.split() for x in subprocess.check_output(['hg', '-R', vcdir, 'tags']).split('\n') if x.startswith(prefix)]
-            current_id = subprocess.check_output(['hg', '-R', vcdir, 'log', '--template', '{rev}\n', '--rev', 'tip']).strip()
+            tagged_ids_out = subprocess.check_output(['hg', '-R', vcdir, 'log', '--rev', 'ancestors(.) and tag("re:{0}[0-9]+\\.[0-9]+")'.format(prefix), '--template', '{tags},{rev}\n'])
+            tagged_ids = [x.split(',') for x in tagged_ids_out.split('\n') if x]
+            current_id = subprocess.check_output(['hg', '-R', vcdir, 'log', '--template', '{rev}\n', '--rev', '.']).strip()
         except subprocess.CalledProcessError as e:
             if abortOnError:
                 abort('hg tags or hg tip failed: ' + str(e))
             else:
                 return None
 
-        if tags and current_id:
-            sorted_tags = sorted(tags, key=lambda e: [int(x) for x in e[0][len(prefix):].split('.')], reverse=True)
-            most_recent_tag_name, most_recent_tag_revision = sorted_tags[0]
-            most_recent_tag_id = most_recent_tag_revision[:most_recent_tag_revision.index(":")]
-            most_recent_tag_version = most_recent_tag_name[len(prefix):]
+        if tagged_ids and current_id:
+            def single(it):
+                v = next(it)
+                try:
+                    next(it)
+                    abort('iterator contained more than a single element')
+                except StopIteration:
+                    return v
+            tagged_ids = [(single((tag for tag in tags.split(' ') if tag.startswith(prefix))), revid) for tags, revid in tagged_ids]
+            version_ids = [([int(x) for x in tag[len(prefix):].split('.')], revid) for tag, revid in tagged_ids]
+            version_ids = sorted(version_ids, key=lambda e: e[0], reverse=True)
+            most_recent_tag_version, most_recent_tag_id = version_ids[0]
 
-            # tagged commit is one-off with commit that tags it
-            if int(current_id) - int(most_recent_tag_id) <= 1:
-                return most_recent_tag_version
+            if current_id == most_recent_tag_id:
+                return '.'.join((str(e) for e in most_recent_tag_version))
             else:
-                major, minor = map(int, most_recent_tag_version.split('.'))
+                major, minor = most_recent_tag_version
                 return str(major) + '.' + str(minor + 1) + '-' + snapshotSuffix
         return None
 
@@ -2836,16 +2892,14 @@ class HgConfig(VC):
         return rc == 0
 
     def update(self, vcdir, rev=None, mayPull=False, clean=False, abortOnError=False):
+        if rev and mayPull and not self.exists(vcdir, rev):
+            self.pull(vcdir, rev=rev, update=False, abortOnError=abortOnError)
         cmd = ['hg', '-R', vcdir, 'update']
         if rev:
             cmd += ['-r', rev]
         if clean:
             cmd += ['-C']
-        result = self.run(cmd, nonZeroIsFatal=abortOnError) == 0
-        if not result and mayPull and rev:
-            self.pull(vcdir, rev=rev, update=False, abortOnError=abortOnError)
-            result = self.update(vcdir, rev=rev, clean=clean, abortOnError=abortOnError)
-        return result
+        return self.run(cmd, nonZeroIsFatal=abortOnError) == 0
 
     def locate(self, vcdir, patterns=None, abortOnError=True):
         if patterns is None:
@@ -2901,10 +2955,11 @@ class HgConfig(VC):
     def exists(self, vcdir, rev):
         self.check_for_hg()
         try:
-            subprocess.check_output(['hg', '-R', vcdir, 'log', '-r', rev])
-            return True
+            sentinel = 'exists'
+            out = subprocess.check_output(['hg', '-R', vcdir, 'log', '-r', 'present({})'.format(rev), '--template', sentinel])
+            return sentinel in out
         except subprocess.CalledProcessError:
-            return False
+            abort('exists failed')
 
 
 class GitConfig(VC):
@@ -2925,6 +2980,7 @@ class GitConfig(VC):
 
     def is_this_vc(self, vcdir):
         gitDir = join(vcdir, self.metadir())
+        # check for existence to also cover git submodules
         return os.path.exists(gitDir)
 
     def metadir(self):
@@ -2938,15 +2994,23 @@ class GitConfig(VC):
     def commit(self, vcdir, msg, abortOnError=True):
         return self.run(['git', '-C', vcdir, 'commit', '-m', msg]) == 0
 
-    def tip(self, vcdir, abortOnError=True):
+    def _rev_parse(self, vcdir, rev, abortOnError=True):
         self.check_for_git()
         try:
-            return subprocess.check_output(['git', '-C', vcdir, 'rev-parse', 'HEAD'])
+            return subprocess.check_output(['git', '-C', vcdir, 'rev-parse', rev]).strip()
         except subprocess.CalledProcessError:
             if abortOnError:
-                abort('git tip failed')
+                abort('git _rev_parse with ' + rev + ' failed')
             else:
                 return None
+
+    def tip(self, vcdir, abortOnError=True):
+        info = self._getBranchInfo(vcdir, abortOnError=abortOnError)
+        check = info[1] + '/' + info[2]
+        return self._rev_parse(vcdir, check, abortOnError=abortOnError)
+
+    def parent(self, vcdir, abortOnError=True):
+        return self._rev_parse(vcdir, 'HEAD', abortOnError=abortOnError)
 
     def clone(self, url, dest=None, rev=None, abortOnError=True, **extra_args):
         cmd = ['git', 'clone']
@@ -2988,7 +3052,7 @@ class GitConfig(VC):
     def push(self, vcdir, dest=None, rev=None, abortOnError=False):
         '''
         Omits the --force flag, instead pushes to branch 'mx_push'
-        to avoid overriden the master branch.
+        to avoid overriden the master branch (if rev is specified).
         '''
         cmd = ['git', '-C', vcdir, 'push']
         if dest:
@@ -3027,7 +3091,6 @@ class GitConfig(VC):
     def incoming(self, vcdir, abortOnError=True):
         return self._checkCommits(vcdir, incoming=True, abortOnError=abortOnError)
 
-
     def outgoing(self, vcdir, dest=None, abortOnError=True):
         '''
         The current branch's target remote branch is taken.
@@ -3058,10 +3121,10 @@ class GitConfig(VC):
             return False
 
     def default_push(self, vcdir, abortOnError=True):
-        return self._getRemoteName(vcdir, 'push', abortOnError=abortOnError)
+        return self._getRepositoryURI(vcdir, 'push', abortOnError=abortOnError)
 
     def default_pull(self, vcdir, abortOnError=True):
-        return self._getRemoteName(vcdir, 'fetch', abortOnError=abortOnError)
+        return self._getRepositoryURI(vcdir, 'fetch', abortOnError=abortOnError)
 
     def isDirty(self, vcdir, abortOnError=True):
         self.check_for_git()
@@ -3093,16 +3156,17 @@ class GitConfig(VC):
                 return None
 
     def _checkCommits(self, vcdir, incoming, abortOnError=True):
-        remote = self._getUpstream(vcdir, abortOnError=abortOnError)
-        if not remote:
+        info = self._getBranchInfo(vcdir, abortOnError=abortOnError)
+        print info
+        if not info[1]:
             if abortOnError:
-                abort('current branch has no remote repository specified')
+                abort('branch has no remote repository')
             else:
                 return None
 
-        rc = self.run(['git', '-C', vcdir, 'fetch', remote[0]])
+        rc = self.run(['git', '-C', vcdir, 'fetch', info[1]])
         if rc == 0:
-            check = remote[0] + '/' + remote[1]
+            check = info[1] + '/' + info[2]
             check = '..' + check if incoming else check + '..'
             print 'changes for {}'.format(check)
             out = OutputCapture()
@@ -3150,43 +3214,46 @@ class GitConfig(VC):
                 abort(" ".join(args) + ' returned ' + str(rc))
             return None
 
-    def _getRemoteName(self, vcdir, tpe, abortOnError=True):
-        branches = LinesOutputCapture()
-        self.run(['git', '-C', vcdir, 'branch', '-vv'], out=branches)
-        name = ''
-        for branch in branches.lines:
-            if branch.strip().startswith('*'): # current branch
-                m = re.search(ur'\[(\w+)/', branch)
+    def _getRepositoryURI(self, vcdir, tpe, abortOnError=True):
+        '''
+        Retrieves the url of the remote assigned for the checked out branch.
+        '''
+        info = self._getBranchInfo(vcdir)
+        if info[1]: # has remote
+            remotes = LinesOutputCapture()
+            self.run(['git', 'remote', '-v'], out=remotes)
+            for remote in remotes.lines:
+                m = re.search(info[1] + ur'\s+(.+) \(' + tpe + ur'\)', remote)
                 if m:
-                    name = m.group(1).strip()
-
-        remotes = LinesOutputCapture()
-        self.run(['git', 'remote', '-v'], out=remotes)
-        for remote in remotes.lines:
-            print remote
-            m = re.search(name + ur'\s+(.+) \(' + tpe + ur'\)', remote)
-            if m:
-                return m.group(1).strip()
+                    return m.group(1).strip()
 
         if abortOnError:
-            abort('no remotes found')
+            abort('branch has no remote repository assigned')
         else:
             return None
 
-    def _getUpstream(self, vcdir, abortOnError=True):
+    def _getBranchInfo(self, vcdir, abortOnError=True):
+        '''
+        Returns the triple: (<local branch name>, <remote name>, <tracked remote branch name>).
+        If the branch tacks no remote branch, remote name and branch are 'None'.
+        '''
         branches = LinesOutputCapture()
         self.run(['git', '-C', vcdir, 'branch', '-vv'], out=branches)
         for branch in branches.lines:
-            m = re.search(ur'\*\s(\S+).+\[(\S+)\/(\S+)[:.+\]|\]].+', branch)
-            if m:
-                # local branch, remote name, remote branch
-                return (m.group(2), m.group(3))
-        return None # current branch has no upstream set
+            local = re.search(ur'\*\s+(\S+).+', branch) # current branch name
+            if local:
+                remote = re.search(ur'.+\[(\S+)\/(\S+)[:.+\]|\]] .+', branch) # check for remote
+                if remote:
+                    return (local.group(1), remote.group(1), remote.group(2))
+                else:
+                    return (local.group(1), None, None) # current branch has no upstream set
+        if abortOnError:
+            abort('illegal state: no branch found')
+        else:
+            return None
 
 
     # Not yet implemented / applicable
-
-    # def parent(self, vcdir, abortOnError=True):
 
     # def release_version_from_tags(self, vcdir, prefix, snapshotSuffix='dev', abortOnError=True):
 
@@ -3208,7 +3275,10 @@ class BinaryVC(VC):
         return True
 
     def is_this_vc(self, vcdir):
-        return self.parent(vcdir, abortOnError=False)
+        try:
+            return self.parent(vcdir, abortOnError=False)
+        except IOError:
+            return False
 
     def clone(self, url, dest=None, rev=None, abortOnError=True, **extra_args):
         '''
@@ -3653,7 +3723,7 @@ def _tmpPomFile(dist, versionGetter, validateMetadata='none'):
     tmp.close()
     return tmp.name
 
-def _deploy_binary_maven(suite, name, jarPath, version, repositoryId, repositoryUrl, srcPath=None, description=None, settingsXml=None, extension='jar', dryRun=False, pomFile=None):
+def _deploy_binary_maven(suite, name, jarPath, version, repositoryId, repositoryUrl, srcPath=None, description=None, settingsXml=None, extension='jar', dryRun=False, pomFile=None, gpg=False, keyid=None):
     assert exists(jarPath)
     assert not srcPath or exists(srcPath)
 
@@ -3671,8 +3741,15 @@ def _deploy_binary_maven(suite, name, jarPath, version, repositoryId, repository
     if settingsXml:
         cmd += ['-s', settingsXml]
 
-    cmd += ['deploy:deploy-file',
-        '-DrepositoryId=' + repositoryId,
+    if gpg:
+        cmd += ['gpg:sign-and-deploy-file']
+    else:
+        cmd += ['deploy:deploy-file']
+
+    if keyid:
+        cmd += ['-Dkeyname=' + keyid]
+
+    cmd += ['-DrepositoryId=' + repositoryId,
         '-Durl=' + repositoryUrl,
         '-DgroupId=' + groupId,
         '-DartifactId=' + artifactId,
@@ -3756,7 +3833,7 @@ def deploy_binary(args):
     _deploy_binary_maven(s, _map_to_maven_dist_name(mxMetaName), mxMetaJar, version, repo.name, repo.url, settingsXml=args.settings, dryRun=args.dry_run)
     _maven_deploy_dists(dists, _versionGetter, repo.name, repo.url, args.settings, dryRun=args.dry_run, licenses=repo.licenses)
 
-def _maven_deploy_dists(dists, versionGetter, repository_id, url, settingsXml, dryRun=False, validateMetadata='none', licenses=None):
+def _maven_deploy_dists(dists, versionGetter, repository_id, url, settingsXml, dryRun=False, validateMetadata='none', licenses=None, gpg=False, keyid=None):
     if licenses is None:
         licenses = []
     for dist in dists:
@@ -3769,9 +3846,10 @@ def _maven_deploy_dists(dists, versionGetter, repository_id, url, settingsXml, d
             if _opts.very_verbose or (dryRun and _opts.verbose):
                 with open(pomFile) as f:
                     log(f.read())
-            _deploy_binary_maven(dist.suite, _map_to_maven_dist_name(dist.remoteName()), dist.prePush(dist.path), versionGetter(dist.suite), repository_id, url, srcPath=dist.prePush(dist.sourcesPath), settingsXml=settingsXml, extension=dist.remoteExtension(), dryRun=dryRun, pomFile=pomFile)
+            _deploy_binary_maven(dist.suite, _map_to_maven_dist_name(dist.remoteName()), dist.prePush(dist.path), versionGetter(dist.suite), repository_id, url, srcPath=dist.prePush(dist.sourcesPath), settingsXml=settingsXml, extension=dist.remoteExtension(),
+                dryRun=dryRun, pomFile=pomFile, gpg=gpg, keyid=keyid)
         elif dist.isTARDistribution():
-            _deploy_binary_maven(dist.suite, _map_to_maven_dist_name(dist.remoteName()), dist.prePush(dist.path), versionGetter(dist.suite), repository_id, url, settingsXml=settingsXml, extension=dist.remoteExtension(), dryRun=dryRun)
+            _deploy_binary_maven(dist.suite, _map_to_maven_dist_name(dist.remoteName()), dist.prePush(dist.path), versionGetter(dist.suite), repository_id, url, settingsXml=settingsXml, extension=dist.remoteExtension(), dryRun=dryRun, gpg=gpg, keyid=keyid)
         else:
             warn('Unsupported distribution: ' + dist.name)
 
@@ -3809,9 +3887,15 @@ def maven_deploy(args):
     parser.add_argument('--only', action='store', help='Limit deployment to these distributions')
     parser.add_argument('--validate', help='Validate that maven metadata is complete enough for publication', default='compat', choices=['none', 'compat', 'full'])
     parser.add_argument('--licenses', help='Comma-separated list of licenses that are cleared for upload. Only used if no url is given. Otherwise licenses are looked up in suite.py', default='')
+    parser.add_argument('--gpg', action='store_true', help='Sign files with gpg before deploying')
+    parser.add_argument('--gpg-keyid', help='GPG keyid to use when signing files (implies --gpg)', default=None)
     parser.add_argument('repository_id', metavar='repository-id', action='store', help='Repository ID used for Maven deploy')
     parser.add_argument('url', metavar='repository-url', nargs='?', action='store', help='Repository URL used for Maven deploy, if no url is given, the repository-id is looked up in suite.py')
     args = parser.parse_args(args)
+
+    if args.gpg_keyid and not args.gpg:
+        args.gpg = True
+        warn('Implicitely setting gpg to true since a keyid was specified')
 
     s = _primary_suite
     _mvn.check()
@@ -3835,7 +3919,7 @@ def maven_deploy(args):
         repo = repository(args.repository_id)
 
     log('Deploying {0} distributions for version {1}'.format(s.name, _versionGetter(s)))
-    _maven_deploy_dists(dists, _versionGetter, repo.name, repo.url, args.settings, dryRun=args.dry_run, validateMetadata=args.validate, licenses=repo.licenses)
+    _maven_deploy_dists(dists, _versionGetter, repo.name, repo.url, args.settings, dryRun=args.dry_run, validateMetadata=args.validate, licenses=repo.licenses, gpg=args.gpg, keyid=args.gpg_keyid)
 
 class MavenConfig:
     def __init__(self):
@@ -3846,7 +3930,7 @@ class MavenConfig:
     def check(self, abortOnError=True):
         if self.has_maven is None:
             try:
-                run_maven(['--version'])
+                run_maven(['--version'], out=lambda e: None)
                 self.has_maven = True
             except OSError:
                 self.has_maven = False
@@ -4533,7 +4617,11 @@ class Suite:
                 sourcePath = _get_path_in_cache(name + '.sources', sourceSha1, sourceUrls, sourceExt)
             theLicense = attrs.pop(self.getMxCompatibility().licenseAttribute(), None)
             optional = attrs.pop('optional', False)
-            l = Library(self, name, path, optional, urls, sha1, sourcePath, sourceUrls, sourceSha1, deps, theLicense)
+            resource = attrs.pop('resource', False)
+            if resource:
+                l = ResourceLibrary(self, name, path, optional, urls, sha1)
+            else:
+                l = Library(self, name, path, optional, urls, sha1, sourcePath, sourceUrls, sourceSha1, deps, theLicense)
             l.__dict__.update(attrs)
             self.libs.append(l)
 
@@ -4822,6 +4910,7 @@ class SourceSuite(Suite):
             Suite._merge_os_arch_attrs(attrs, os_arch, context)
             deps = Suite._pop_list(attrs, 'dependencies', context)
             workingSets = attrs.pop('workingSets', None)
+            jlintOverrides = attrs.pop('lint.overrides', None)
             if className:
                 if not self.extensions or not hasattr(self.extensions, className):
                     abort('Project {} requires a custom class ({}) which was not found in {}'.format(name, className, join(self.mxDir, self._extensions_name() + '.py')))
@@ -4848,6 +4937,8 @@ class SourceSuite(Suite):
                     ap = Suite._pop_list(attrs, 'annotationProcessors', context)
                     if ap:
                         p.declaredAnnotationProcessors = ap
+                    if jlintOverrides:
+                        p._javac_lint_overrides = jlintOverrides
             p.__dict__.update(attrs)
             self.projects.append(p)
 
@@ -5052,6 +5143,9 @@ class MXSuite(InternalSuite):
         self._init_metadata()
         self._post_init()
 
+    def vc_command_init(self):
+        pass
+
 class MXTestsSuite(InternalSuite):
     def __init__(self):
         InternalSuite.__init__(self, join(_mx_home, "tests"))
@@ -5190,19 +5284,8 @@ def _bench_test_common(args, parser, suppliedParser):
         parser.add_argument('remainder', nargs=REMAINDER, metavar='...')
     args = parser.parse_args(args)
 
-    if args.noClean:
-        args.cleanIDE = False
-        args.cleanJava = False
-        args.cleanNative = False
-        args.cleanDist = False
+    cleanArgs = mx_gate.check_gate_noclean_arg(args)
 
-    cleanArgs = []
-    if not args.cleanNative:
-        cleanArgs.append('--no-native')
-    if not args.cleanJava:
-        cleanArgs.append('--no-java')
-    if not args.cleanDist:
-        cleanArgs.append('--no-dist')
     command_function('clean')(cleanArgs)
 
     if args.cleanIDE:
@@ -6029,6 +6112,8 @@ def get_jdk(versionCheck=None, purpose=None, cancel=None, versionDescription=Non
         if versionCheck is None and jdkOpt.compliance:
             versionCheck, versionDescription = _convert_compliance_to_version_check(jdkOpt.compliance)
         tag = jdkOpt.tag if jdkOpt.tag else DEFAULT_JDK_TAG
+    else:
+        jdkOpt = TagCompliance(tag, None)
 
     defaultTag = tag == DEFAULT_JDK_TAG
     defaultJdk = defaultTag and versionCheck is None and not purpose
@@ -6040,11 +6125,14 @@ def get_jdk(versionCheck=None, purpose=None, cancel=None, versionDescription=Non
 
     if tag and not defaultTag:
         factory = _getJDKFactory(tag, jdkOpt.compliance)
-        jdk = factory.getJDKConfig()
-        if jdk.tag is not None:
-            assert jdk.tag == tag
+        if factory:
+            jdk = factory.getJDKConfig()
+            if jdk.tag is not None:
+                assert jdk.tag == tag
+            else:
+                jdk.tag = tag
         else:
-            jdk.tag = tag
+            jdk = None
         return jdk
 
     # interpret string and compliance as compliance check
@@ -6228,7 +6316,12 @@ def _find_jdk(versionCheck=None, versionDescription=None, purpose=None, cancel=N
 
 def ask_persist_env(varName, value, valueSeparator=None):
     if not _primary_suite:
+        def _deferrable():
+            assert _primary_suite
+            ask_persist_env(varName, value, valueSeparator)
+        _primary_suite_deferrables.append(_deferrable)
         return
+
     envPath = join(_primary_suite.mxDir, 'env')
     if is_interactive() and ask_yes_no('Persist this setting by adding "{0}={1}" to {2}'.format(varName, value, envPath), 'y'):
         envLines = []
@@ -6871,14 +6964,34 @@ class JDKConfig:
         return False
 
     def getKnownJavacLints(self):
+        '''
+        Gets the lint warnings supported by this JDK.
+        '''
         if self._knownJavacLints is None:
             out = subprocess.check_output([self.javac, '-X'], stderr=subprocess.STDOUT)
-            lintre = re.compile(r"-Xlint:\{([a-z-]+(?:,[a-z-]+)*)\}")
-            m = lintre.search(out)
-            if not m:
-                self._knownJavacLints = []
+            if self.javaCompliance < JavaCompliance('1.9'):
+                lintre = re.compile(r"-Xlint:\{([a-z-]+(?:,[a-z-]+)*)\}")
+                m = lintre.search(out)
+                if not m:
+                    self._knownJavacLints = []
+                else:
+                    self._knownJavacLints = m.group(1).split(',')
             else:
-                self._knownJavacLints = m.group(1).split(',')
+                self._knownJavacLints = []
+                lines = out.split(os.linesep)
+                inLintSection = False
+                for line in lines:
+                    if not inLintSection:
+                        if line.strip() == '-Xlint:key,...':
+                            inLintSection = True
+                    else:
+                        if line.startswith('         '):
+                            warning = line.split()[0]
+                            self._knownJavacLints.append(warning)
+                            self._knownJavacLints.append('-' + warning)
+                        elif line.strip().startswith('-X'):
+                            return self._knownJavacLints
+                warn('Did not find lint warnings in output of "javac -X"')
         return self._knownJavacLints
 
 def check_get_env(key):
@@ -7545,6 +7658,7 @@ def pylint(args):
     """run pylint (if available) over Python source files (found by '<vc> locate' or by tree walk with -walk)"""
 
     parser = ArgumentParser(prog='mx pylint')
+    _add_command_primary_option(parser)
     parser.add_argument('--walk', action='store_true', help='use tree walk find .py files')
     args = parser.parse_args(args)
 
@@ -7569,6 +7683,8 @@ def pylint(args):
 
     def findfiles_by_walk(pyfiles):
         for suite in suites(True, includeBinary=False):
+            if args.primary and not suite.primary:
+                continue
             for root, dirs, files in os.walk(suite.dir):
                 for f in files:
                     if f.endswith('.py'):
@@ -7582,6 +7698,8 @@ def pylint(args):
 
     def findfiles_by_vc(pyfiles):
         for suite in suites(True, includeBinary=False):
+            if args.primary and not suite.primary:
+                continue
             files = suite.vc.locate(suite.dir, ['*.py'])
             for pyfile in files:
                 if exists(pyfile):
@@ -8249,14 +8367,21 @@ def make_eclipse_launch(suite, javaArgs, jre, name=None, deps=None):
     ensure_dir_exists(eclipseLaunches)
     return update_file(join(eclipseLaunches, name + '.launch'), launch)
 
-def eclipseinit(args, buildProcessorJars=True, refreshOnly=False):
+def eclipseinit_cli(args):
+    parser = ArgumentParser(prog='mx eclipseinit')
+    parser.add_argument('--no-build', action='store_false', dest='buildProcessorJars', help='Do not build annotation processor jars.')
+    parser.add_argument('-C', '--log-to-console', action='store_true', dest='logToConsole', help='Send builder output to eclipse console.')
+    args = parser.parse_args(args)
+    eclipseinit(None, args.buildProcessorJars, logToConsole=args.logToConsole)
+
+def eclipseinit(args, buildProcessorJars=True, refreshOnly=False, logToConsole=False):
     """(re)generate Eclipse project configurations and working sets"""
     for s in suites(True):
-        _eclipseinit_suite(args, s, buildProcessorJars, refreshOnly)
+        _eclipseinit_suite(s, buildProcessorJars, refreshOnly, logToConsole)
 
     generate_eclipse_workingsets()
 
-def _check_ide_timestamp(suite, configZip, ide):
+def _check_ide_timestamp(suite, configZip, ide, settingsFile=None):
     """
     Returns True if and only if suite.py for *suite*, all *configZip* related resources in
     *suite* and mx itself are older than *configZip*.
@@ -8266,6 +8391,9 @@ def _check_ide_timestamp(suite, configZip, ide):
         return False
     # Assume that any mx change might imply changes to the generated IDE files
     if configZip.isOlderThan(__file__):
+        return False
+
+    if settingsFile and configZip.isOlderThan(settingsFile):
         return False
 
     if ide == 'eclipse':
@@ -8290,8 +8418,10 @@ def get_eclipse_project_rel_locationURI(path, eclipseProjectDir):
     parents = len([n for n in names if n == '..'])
     sep = '/' # Yes, even on Windows...
     if parents:
-        return join('PARENT-{}-PROJECT_LOC'.format(parents), sep.join([n for n in names if n != '..']))
-    return join('PROJECT_LOC', sep.join([n for n in names if n != '..']))
+        projectLoc = 'PARENT-{}-PROJECT_LOC'.format(parents)
+    else:
+        projectLoc = 'PROJECT_LOC'
+    return sep.join([projectLoc] + [n for n in names if n != '..'])
 
 def _convert_to_eclipse_supported_compliance(compliance):
     """
@@ -8520,7 +8650,19 @@ def _eclipseinit_project(p, files=None, libFiles=None):
         if files:
             files.append(join(p.dir, '.factorypath'))
 
-def _eclipseinit_suite(args, suite, buildProcessorJars=True, refreshOnly=False):
+def _capture_eclipse_settings(logToConsole):
+    # Capture interesting settings which drive the output of the projects.
+    # Changes to these values should cause regeneration of the project files.
+    value = 'logToConsole=%s\n' % logToConsole
+    if os.environ.get('PATH'):
+        value = value + 'PATH=%s\n' % os.environ['PATH']
+    if os.environ.get('JAVA_HOME'):
+        value = value + 'JAVA_HOME=%s\n' % os.environ['JAVA_HOME']
+    if os.environ.get('DEFAULT_VM'):
+        value = value + 'DEFAULT_VM=%s\n' % os.environ['DEFAULT_VM']
+    return value
+
+def _eclipseinit_suite(suite, buildProcessorJars=True, refreshOnly=False, logToConsole=False):
     # a binary suite archive is immutable and no project sources, only the -sources.jar
     # TODO We may need the project (for source debugging) but it needs different treatment
     if isinstance(suite, BinarySuite):
@@ -8532,7 +8674,9 @@ def _eclipseinit_suite(args, suite, buildProcessorJars=True, refreshOnly=False):
     if refreshOnly and not configZip.exists():
         return
 
-    if _check_ide_timestamp(suite, configZip, 'eclipse'):
+    settingsFile = join(mxOutputDir, 'eclipse-project-settings')
+    update_file(settingsFile, _capture_eclipse_settings(logToConsole))
+    if _check_ide_timestamp(suite, configZip, 'eclipse', settingsFile):
         logv('[Eclipse configurations for {} are up to date - skipping]'.format(suite.name))
         return
 
@@ -8576,7 +8720,7 @@ def _eclipseinit_suite(args, suite, buildProcessorJars=True, refreshOnly=False):
         javaCompliances = [_convert_to_eclipse_supported_compliance(p.javaCompliance) for p in dist.archived_deps() if p.isProject()]
         if len(javaCompliances) > 0:
             dist.javaCompliance = max(javaCompliances)
-        _genEclipseBuilder(out, dist, 'Create' + dist.name + 'Dist', '-v archive @' + dist.name, relevantResources=relevantResources, logToFile=True, refresh=False, async=False, logToConsole=False, appendToLogFile=False)
+        _genEclipseBuilder(out, dist, 'Create' + dist.name + 'Dist', '-v archive @' + dist.name, relevantResources=relevantResources, logToFile=True, refresh=False, async=False, logToConsole=logToConsole, appendToLogFile=False)
         out.close('buildSpec')
         out.open('natures')
         out.element('nature', data='org.eclipse.jdt.core.javanature')
@@ -8586,7 +8730,7 @@ def _eclipseinit_suite(args, suite, buildProcessorJars=True, refreshOnly=False):
         update_file(projectFile, out.xml(indent='\t', newl='\n'))
         files.append(projectFile)
 
-    _zip_files(files, suite.dir, configZip.path)
+    _zip_files(files + [settingsFile], suite.dir, configZip.path)
     _zip_files(libFiles, suite.dir, configLibsZip)
 
 def _zip_files(files, baseDir, zipPath):
@@ -8615,8 +8759,17 @@ def _genEclipseBuilder(dotProjectDoc, p, name, mxCommand, refresh=True, refreshF
     launchOut.element('booleanAttribute', {'key' : 'org.eclipse.debug.core.capture_output', 'value': consoleOn})
     launchOut.open('mapAttribute', {'key' : 'org.eclipse.debug.core.environmentVariables'})
     launchOut.element('mapEntry', {'key' : 'JAVA_HOME', 'value' : get_jdk().home})
-    if os.environ['PATH']:
+    # On the mac, applications are launched with a different path than command
+    # line tools, so capture the current PATH.  In general this ensures that
+    # the eclipse builders see the same path as a working command line build.
+    if os.environ.get('PATH'):
         launchOut.element('mapEntry', {'key' : 'PATH', 'value' : os.environ['PATH']})
+    # The mx builders are run inside the directory of their associated suite,
+    # not the primary suite, so they might not see the env file of the primary
+    # suite.  Capture DEFAULT_VM in case it was only defined in the primary
+    # suite.
+    if os.environ.get('DEFAULT_VM'):
+        launchOut.element('mapEntry', {'key' : 'DEFAULT_VM', 'value' : os.environ['DEFAULT_VM']})
     launchOut.close('mapAttribute')
 
     if refresh:
@@ -8661,7 +8814,7 @@ def _genEclipseBuilder(dotProjectDoc, p, name, mxCommand, refresh=True, refreshF
     launchOut.element('stringAttribute', {'key' : 'org.eclipse.ui.externaltools.ATTR_RUN_BUILD_KINDS', 'value': 'auto,full,incremental'})
     launchOut.element('stringAttribute', {'key' : 'org.eclipse.ui.externaltools.ATTR_TOOL_ARGUMENTS', 'value': mxCommand})
     launchOut.element('booleanAttribute', {'key' : 'org.eclipse.ui.externaltools.ATTR_TRIGGERS_CONFIGURED', 'value': 'true'})
-    launchOut.element('stringAttribute', {'key' : 'org.eclipse.ui.externaltools.ATTR_WORKING_DIRECTORY', 'value': _primary_suite.dir})
+    launchOut.element('stringAttribute', {'key' : 'org.eclipse.ui.externaltools.ATTR_WORKING_DIRECTORY', 'value': p.suite.dir})
 
 
     launchOut.close('launchConfiguration')
@@ -9534,6 +9687,8 @@ def javadoc(args, parser=None, docDir='javadoc', includeDeps=True, stdDoclet=Tru
     def assess_candidate(p, projects):
         if p in projects:
             return False
+        if not args.implementation and p.name.endswith('.test'):
+            return False
         if args.force or args.unified or check_package_list(p):
             projects.append(p)
             return True
@@ -9546,7 +9701,7 @@ def javadoc(args, parser=None, docDir='javadoc', includeDeps=True, stdDoclet=Tru
                 p.walk_deps(visit=lambda dep, edge: assess_candidate(dep, projects) if dep.isProject() else None)
             if not assess_candidate(p, projects):
                 logv('[package-list file exists - skipping {0}]'.format(p.name))
-
+   
 
     extraArgs = [a.lstrip('@') for a in args.extra_args]
     if args.argfile is not None:
@@ -10085,13 +10240,13 @@ def sbookmarkimports(args):
         _check_primary_suite().visit_imports(_sbookmark_visitor)
 
 
-def _scheck_imports_visitor(s, suite_import, bookmark_imports):
+def _scheck_imports_visitor(s, suite_import, bookmark_imports, ignore_uncommitted):
     """scheckimports visitor for Suite.visit_imports"""
-    _scheck_imports(s, suite(suite_import.name), suite_import, bookmark_imports)
+    _scheck_imports(s, suite(suite_import.name), suite_import, bookmark_imports, ignore_uncommitted)
 
-def _scheck_imports(importing_suite, imported_suite, suite_import, bookmark_imports):
+def _scheck_imports(importing_suite, imported_suite, suite_import, bookmark_imports, ignore_uncommitted):
     importedVersion = imported_suite.version()
-    if imported_suite.isDirty():
+    if imported_suite.isDirty() and not ignore_uncommitted:
         msg = 'uncommitted changes in {}, please commit them and re-run scheckimports'.format(imported_suite.name)
         if isinstance(imported_suite, SourceSuite) and imported_suite.vc and imported_suite.vc.kind == 'hg':
             msg = '{}\nIf the only uncommitted change is an updated imported suite version, then you can run:\n\nhg -R {} commit -m "updated imported suite version"'.format(msg, imported_suite.dir)
@@ -10114,10 +10269,11 @@ def scheckimports(args):
     """check that suite import versions are up to date"""
     parser = ArgumentParser(prog='mx scheckimports')
     parser.add_argument('-b', '--bookmark-imports', action='store_true', help="keep the import bookmarks up-to-date when updating the suites.py file")
+    parser.add_argument('-i', '--ignore-uncommitted', action='store_true', help="Ignore uncommitted changes in the suite")
     args = parser.parse_args(args)
     # check imports of all suites
     for s in suites():
-        s.visit_imports(_scheck_imports_visitor, bookmark_imports=args.bookmark_imports)
+        s.visit_imports(_scheck_imports_visitor, bookmark_imports=args.bookmark_imports, ignore_uncommitted=args.ignore_uncommitted)
 
 def _sforce_imports_visitor(s, suite_import, import_map, strict_versions, **extra_args):
     """sforceimports visitor for Suite.visit_imports"""
@@ -10288,6 +10444,38 @@ def stip(args):
     s = _check_primary_suite()
 
     _stip(s, None)
+
+def _sversions_rev(rev, isdirty, with_color):
+    if with_color:
+        color_on, color_off = '\033[93m', '\033[0m'
+    else:
+        color_on = color_off = ''
+    return color_on + rev[0:12] + color_off + rev[12:] + ' +'[int(isdirty)]
+
+def sversions(args):
+    '''print working directory revision for primary suite and all imports'''
+    parser = ArgumentParser(prog='mx sversions')
+    parser.add_argument('--color', action='store_true', help='color the short form part of the revision id')
+    args = parser.parse_args(args)
+    with_color = args.color
+    visited = set()
+
+    def _sversions_import_visitor(s, suite_import, **extra_args):
+        _sversions(suite(suite_import.name), suite_import)
+
+    def _sversions(s, suite_import):
+        if s.dir in visited:
+            return
+        visited.add(s.dir)
+        if s.vc == None:
+            print 'No version control info for suite ' + s.name
+        else:
+            print _sversions_rev(s.vc.parent(s.dir), s.vc.isDirty(s.dir), with_color) + ' ' + s.name
+        s.visit_imports(_sversions_import_visitor)
+
+    primary_suite = _check_primary_suite()
+    if not isinstance(primary_suite, MXSuite):
+        _sversions(primary_suite, None)
 
 def findclass(args, logToConsole=True, resolve=True, matcher=lambda string, classname: string in classname):
     """find all classes matching a given substring"""
@@ -10667,6 +10855,9 @@ def assessannotationprocessors(args):
                         log('"annotationProcessors" attribute of {} should not include {}'.format(p, apdepName))
                     log('Could not find any matches for these patterns: ' + ', '.join(annotations))
 
+def _add_command_primary_option(parser):
+    parser.add_argument('--primary', action='store_true', help='limit checks to primary suite')
+
 def checkcopyrights(args):
     '''run copyright check on the sources'''
     class CP(ArgumentParser):
@@ -10682,7 +10873,7 @@ def checkcopyrights(args):
 
     parser = CP(prog='mx checkcopyrights')
 
-    parser.add_argument('--primary', action='store_true', help='limit checks to primary suite')
+    _add_command_primary_option(parser)
     parser.add_argument('remainder', nargs=REMAINDER, metavar='...')
     args = parser.parse_args(args)
     remove_doubledash(args.remainder)
@@ -10868,6 +11059,18 @@ def show_envs(args):
 
 def show_version(args):
     '''print mx version'''
+
+    parser = ArgumentParser(prog='mx version')
+    parser.add_argument('--oneline', action='store_true', help='show mx revision and version in one line')
+    args = parser.parse_args(args)
+    if args.oneline:
+        vc = VC.get_vc(_mx_home, abortOnError=False)
+        if vc == None:
+            print 'No version control info for mx %s' % version
+        else:
+            print _sversions_rev(vc.parent(_mx_home), vc.isDirty(_mx_home), False) + ' mx %s' % version
+        return
+
     print version
     vc = VC.get_vc(_mx_home, abortOnError=False)
     if isinstance(vc, HgConfig):
@@ -10938,8 +11141,14 @@ def update_commands(suite, new_commands):
                 # Previously specified command from another suite
                 # is made available using a qualified name.
                 # The last (primary) suite (depth-first init) always defines the generic command
-                qkey = oldSuite.name + ':' + key
-                _commands[qkey] = old
+                # N.B. Dynamically loaded suites loaded via Suite.import_suite register after the primary
+                # suite but they must not override the primary definition.
+                if oldSuite == _primary_suite:
+                    # ensure registered as qualified by the registering suite
+                    key = suite.name  + ':' + key
+                else:
+                    qkey = oldSuite.name + ':' + key
+                    _commands[qkey] = old
         _commands[key] = value
         _commandsToSuite[key] = suite
 
@@ -10985,7 +11194,7 @@ _commands = {
     'checkstyle': [checkstyle, ''],
     'sigtest': [mx_sigtest.sigtest, ''],
     'clean': [clean, ''],
-    'eclipseinit': [eclipseinit, ''],
+    'eclipseinit': [eclipseinit_cli, ''],
     'eclipseformat': [eclipseformat, ''],
     'exportlibs': [exportlibs, ''],
     'findbugs': [mx_findbugs.findbugs, ''],
@@ -11012,6 +11221,7 @@ _commands = {
     'spull': [spull, '[options]'],
     'spush': [spush, '[options]'],
     'stip': [stip, ''],
+    'sversions': [sversions, '[options]'],
     'supdate': [supdate, ''],
     'hg': [hg_command, '[options]'],
     'pylint': [pylint, ''],
@@ -11079,7 +11289,7 @@ def _check_primary_suite():
 # vc (suite) commands only perform a partial load of the suite metadata, to avoid
 # problems with suite invariant checks aborting the operation
 _vc_commands = ['sclone', 'scloneimports', 'scheckimports', 'sbookmarkimports', 'sforceimports', 'spull',
-                'sincoming', 'soutgoing', 'spull', 'spush', 'stip', 'supdate']
+                'sincoming', 'soutgoing', 'spull', 'spush', 'stip', 'sversions', 'supdate']
 
 def _needs_primary_suite(command):
     return not command in _primary_suite_exempt and not command in _suite_context_free
@@ -11215,6 +11425,13 @@ def _get_command_property(command, propertyName):
             return props[propertyName]
     return None
 
+def _init_primary_suite(s):
+    global _primary_suite
+    assert not _primary_suite
+    _primary_suite = s
+    for deferrable in _primary_suite_deferrables:
+        deferrable()
+
 def main():
     global _mx_suite
     _mx_suite = MXSuite()
@@ -11228,13 +11445,12 @@ def main():
     global _mvn
     _mvn = MavenConfig()
 
-    global _primary_suite
     primarySuiteMxDir = None
     if len(_argParser.initialCommandAndArgs) == 0 or _argParser.initialCommandAndArgs[0] not in _suite_context_free:
         primary_suite_error = 'no primary suite found'
         primarySuiteMxDir = _findPrimarySuiteMxDir()
         if primarySuiteMxDir == _mx_suite.mxDir:
-            _primary_suite = _mx_suite
+            _init_primary_suite(_mx_suite)
         elif primarySuiteMxDir:
             _src_suitemodel.set_primary_dir(dirname(primarySuiteMxDir))
             # We explicitly load the 'env' file of the primary suite now as it might influence
@@ -11260,7 +11476,7 @@ def main():
                     _suites_ignore_versions = []
 
             # This will load all explicitly imported suites, unless it's a vc command
-            _primary_suite = PrimarySuite(primarySuiteMxDir, load=not vc_command)
+            _init_primary_suite(PrimarySuite(primarySuiteMxDir, load=not vc_command))
         else:
             # in general this is an error, except for the _primary_suite_exempt commands,
             # and an extensions command will likely not parse in this case, as any extra arguments
@@ -11339,7 +11555,7 @@ def main():
         # no need to show the stack trace when the user presses CTRL-C
         abort(1)
 
-version = VersionSpec("5.5.14")
+version = VersionSpec("5.6.5")
 
 currentUmask = None
 

@@ -30,7 +30,6 @@ from argparse import ArgumentParser
 import xml.dom.minidom
 
 import mx
-import mx_findbugs
 
 """
 Context manager for a single gate task that can prevent the
@@ -144,18 +143,29 @@ def add_omit_clean_args(parser):
     parser.add_argument('-d', '--omit-dist-clean', action='store_false', dest='cleanDist', help='omit cleaning distributions')
     parser.add_argument('-o', '--omit-clean', action='store_true', dest='noClean', help='equivalent to -j -n -e')
 
-def gate_clean(args, tasks, name='Clean'):
+def gate_clean(cleanArgs, tasks, name='Clean'):
     with Task(name, tasks) as t:
         if t:
-            cleanArgs = []
-            if not args.cleanNative:
-                cleanArgs.append('--no-native')
-            if not args.cleanJava:
-                cleanArgs.append('--no-java')
-            if not args.cleanDist:
-                cleanArgs.append('--no-dist')
             mx.command_function('clean')(cleanArgs)
 
+def check_gate_noclean_arg(args):
+    '''
+    Checks the -o option (noClean) and sets the sub-options in args appropriately
+    and returns the relevant args for the clean command (N.B. IDE currently ignored).
+    '''
+    if args.noClean:
+        args.cleanIDE = False
+        args.cleanJava = False
+        args.cleanNative = False
+        args.cleanDist = False
+    cleanArgs = []
+    if not args.cleanNative:
+        cleanArgs.append('--no-native')
+    if not args.cleanJava:
+        cleanArgs.append('--no-java')
+    if not args.cleanDist:
+        cleanArgs.append('--no-dist')
+    return cleanArgs
 
 def _warn_or_abort(msg, strict_mode):
     reporter = mx.abort if strict_mode else mx.warn
@@ -180,6 +190,7 @@ def gate(args):
         parser.add_argument(*a, **k)
 
     args = parser.parse_args(args)
+    cleanArgs = check_gate_noclean_arg(args)
 
     global _jacoco
     if args.dry_run:
@@ -192,64 +203,74 @@ def gate(args):
     elif args.x:
         mx.abort('-x option cannot be used without --task-filter option')
 
-    # Force
-    if not mx._opts.strict_compliance:
-        mx.log("[gate] forcing strict compliance")
-        mx._opts.strict_compliance = True
-
     tasks = []
     total = Task('Gate')
     try:
-        with Task('Pylint', tasks) as t:
-            if t: mx.pylint([])
+        with Task('Versions', tasks) as t:
+            if t:
+                mx.command_function('version')(['--oneline'])
+                mx.command_function('sversions')([])
 
-        gate_clean(args, tasks)
+        with Task('JDKReleaseInfo', tasks) as t:
+            if t:
+                jdkDirs = os.pathsep.join([mx.get_env('JAVA_HOME', ''), mx.get_env('EXTRA_JAVA_HOMES', '')])
+                for jdkDir in jdkDirs.split(os.pathsep):
+                    release = join(jdkDir, 'release')
+                    if exists(release):
+                        mx.log('==== ' + jdkDir + ' ====')
+                        with open(release) as fp:
+                            mx.log(fp.read().strip())
+
+        with Task('Pylint', tasks) as t:
+            if t: mx.command_function('pylint')([])
+
+        gate_clean(cleanArgs, tasks)
 
         with Task('Distribution Overlap Check', tasks) as t:
             if t:
-                if mx.checkoverlap([]) != 0:
+                if mx.command_function('checkoverlap')([]) != 0:
                     t.abort('Found overlapping distributions.')
 
         with Task('Canonicalization Check', tasks) as t:
             if t:
                 mx.log(time.strftime('%d %b %Y %H:%M:%S - Ensuring mx/projects files are canonicalized...'))
-                if mx.canonicalizeprojects([]) != 0:
+                if mx.command_function('canonicalizeprojects')([]) != 0:
                     t.abort('Rerun "mx canonicalizeprojects" and check-in the modified mx/suite*.py files.')
 
         if mx.get_env('JDT'):
-            with Task('BuildJavaWithEcj', tasks):
-                if t: mx.build(['-p', '--no-native', '--warning-as-error'])
-            gate_clean(args, tasks, name='CleanAfterEcjBuild')
+            with Task('BuildJavaWithEcj', tasks) as t:
+                if t: mx.command_function('build')(['-p', '--no-native', '--warning-as-error'])
+            gate_clean(cleanArgs, tasks, name='CleanAfterEcjBuild')
         else:
             _warn_or_abort('JDT environment variable not set. Cannot execute BuildJavaWithEcj task.', args.strict_mode)
 
         with Task('BuildJavaWithJavac', tasks) as t:
-            if t: mx.build(['-p', '--warning-as-error', '--no-native', '--force-javac'])
+            if t: mx.command_function('build')(['-p', '--warning-as-error', '--no-native', '--force-javac'])
 
         with Task('IDEConfigCheck', tasks) as t:
             if t:
                 if args.cleanIDE:
-                    mx.ideclean([])
-                    mx.ideinit([])
+                    mx.command_function('ideclean')([])
+                    mx.command_function('ideinit')([])
 
         eclipse_exe = mx.get_env('ECLIPSE_EXE')
         if eclipse_exe is not None:
             with Task('CodeFormatCheck', tasks) as t:
-                if t and mx.eclipseformat(['-e', eclipse_exe]) != 0:
+                if t and mx.command_function('eclipseformat')(['-e', eclipse_exe]) != 0:
                     t.abort('Formatter modified files - run "mx eclipseformat", check in changes and repush')
         else:
             _warn_or_abort('ECLIPSE_EXE environment variable not set. Cannot execute CodeFormatCheck task.', args.strict_mode)
 
         with Task('Checkstyle', tasks) as t:
-            if t and mx.checkstyle([]) != 0:
+            if t and mx.command_function('checkstyle')([]) != 0:
                 t.abort('Checkstyle warnings were found')
 
         with Task('Checkheaders', tasks) as t:
-            if t and checkheaders([]) != 0:
+            if t and mx.command_function('checkheaders')([]) != 0:
                 t.abort('Checkheaders warnings were found')
 
         with Task('FindBugs', tasks) as t:
-            if t and mx_findbugs.findbugs([]) != 0:
+            if t and mx.command_function('findbugs')([]) != 0:
                 t.abort('FindBugs warnings were found')
 
         if exists('jacoco.exec'):
@@ -266,7 +287,7 @@ def gate(args):
                 runner(args, tasks)
 
         if args.jacocout is not None:
-            jacocoreport([args.jacocout])
+            mx.command_function('jacocoreport')([args.jacocout])
             _jacoco = 'off'
 
     except KeyboardInterrupt:
