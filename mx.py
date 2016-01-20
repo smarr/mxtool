@@ -31,6 +31,8 @@ mx is a command line tool for managing the development of Java code organized as
 Full documentation can be found in the Wiki at https://bitbucket.org/allr/mxtool2/wiki/Home
 """
 import sys
+from abc import ABCMeta
+
 if __name__ == '__main__':
     # Rename this module as 'mx' so it is not re-executed when imported by other modules.
     sys.modules['mx'] = sys.modules.pop('__main__')
@@ -58,7 +60,7 @@ from collections import Callable
 from collections import OrderedDict, namedtuple
 from threading import Thread
 from argparse import ArgumentParser, REMAINDER, Namespace
-from os.path import join, basename, dirname, exists, getmtime, isabs, expandvars, isdir, isfile
+from os.path import join, basename, dirname, exists, getmtime, isabs, expandvars, isdir
 
 import mx_unittest
 import mx_findbugs
@@ -788,7 +790,7 @@ Attributes:
     sourcesPath: as path but for source files (optional)
 """
 class JARDistribution(Distribution, ClasspathDependency):
-    def __init__(self, suite, name, subDir, path, sourcesPath, deps, mainClass, excludedLibs, distDependencies, javaCompliance, platformDependent, theLicense):
+    def __init__(self, suite, name, subDir, path, sourcesPath, deps, mainClass, excludedLibs, distDependencies, javaCompliance, platformDependent, theLicense, javadocType="implementation", allowsJavadocWarnings=False):
         Distribution.__init__(self, suite, name, deps + distDependencies, excludedLibs, platformDependent, theLicense)
         ClasspathDependency.__init__(self)
         self.subDir = subDir
@@ -798,6 +800,8 @@ class JARDistribution(Distribution, ClasspathDependency):
         self.mainClass = mainClass
         self.javaCompliance = JavaCompliance(javaCompliance) if javaCompliance else None
         self.definedAnnotationProcessors = []
+        self.javadocType = javadocType
+        self.allowsJavadocWarnings = allowsJavadocWarnings
         assert path.endswith(self.localExtension())
 
     def set_archiveparticipant(self, archiveparticipant):
@@ -1215,6 +1219,8 @@ class Project(Dependency):
         the list of files providing its generated content, in overriding order
         (i.e., settings from files later in the list override settings from
         files earlier in the list).
+        A new dictionary is created each time this method is called so it's
+        safe for the caller to modify it.
         """
         nyi('eclipse_settings_sources', self)
 
@@ -1327,32 +1333,21 @@ class JavaProject(Project, ClasspathDependency):
         the list of files providing its generated content, in overriding order
         (i.e., settings from files later in the list override settings from
         files earlier in the list).
+        A new dictionary is created each time this method is called so it's
+        safe for the caller to modify it.
         """
-        if not hasattr(self, '_eclipse_settings'):
-            esdict = {}
-            hasAps = self.annotation_processors()
-            # start with the mxtool defaults
-            defaultEclipseSettingsDir = join(_mx_suite.dir, 'eclipse-settings')
-            if exists(defaultEclipseSettingsDir):
-                for name in os.listdir(defaultEclipseSettingsDir):
-                    if isfile(join(defaultEclipseSettingsDir, name)) and name != "org.eclipse.jdt.apt.core.prefs" or hasAps:
-                        esdict[name] = [os.path.abspath(join(defaultEclipseSettingsDir, name))]
+        esdict = self.suite.eclipse_settings_sources()
 
-            # append suite overrides
-            eclipseSettingsDir = join(self.suite.mxDir, 'eclipse-settings')
-            if exists(eclipseSettingsDir):
-                for name in os.listdir(eclipseSettingsDir):
-                    if isfile(join(eclipseSettingsDir, name)) and name != "org.eclipse.jdt.apt.core.prefs" or hasAps:
-                        esdict.setdefault(name, []).append(os.path.abspath(join(eclipseSettingsDir, name)))
+        # check for project overrides
+        projectSettingsDir = join(self.dir, 'eclipse-settings')
+        if exists(projectSettingsDir):
+            for name in os.listdir(projectSettingsDir):
+                esdict.setdefault(name, []).append(os.path.abspath(join(projectSettingsDir, name)))
 
-            # check for project overrides
-            projectSettingsDir = join(self.dir, 'eclipse-settings')
-            if exists(projectSettingsDir):
-                for name in os.listdir(projectSettingsDir):
-                    if isfile(join(projectSettingsDir, name)) and name != "org.eclipse.jdt.apt.core.prefs" or hasAps:
-                        esdict.setdefault(name, []).append(os.path.abspath(join(projectSettingsDir, name)))
-            self._eclipse_settings = esdict
-        return self._eclipse_settings
+        if not self.annotation_processors():
+            esdict.pop("org.eclipse.jdt.apt.core.prefs", None)
+
+        return esdict
 
     def find_classes_with_annotations(self, pkgRoot, annotations, includeInnerClasses=False):
         """
@@ -2050,9 +2045,11 @@ def _get_path_in_cache(name, sha1, urls, ext=None):
     if ext is None:
         for url in urls:
             # Use extension of first URL whose path component ends with a non-empty extension
-            _, _, path, _, query, _ = urlparse.urlparse(url)
-            if path == "/remotecontent" and query.startswith("filepath"):
-                path = query
+            o = urlparse.urlparse(url)
+            if o.path == "/remotecontent" and o.query.startswith("filepath"):
+                path = o.query
+            else:
+                path = o.path
             _, ext = os.path.splitext(path)
             if ext:
                 break
@@ -2140,7 +2137,7 @@ def _check_file_with_sha1(path, sha1, sha1path, mustExist=True, newFile=False):
     def _sha1CachedValid():
         if not exists(sha1path):
             return False
-        if os.stat(path).st_mtime > os.stat(sha1path).st_mtime:
+        if TimeStampFile(path, followSymlinks=True).isNewerThan(sha1path):
             return False
         return True
 
@@ -2155,9 +2152,14 @@ def _check_file_with_sha1(path, sha1, sha1path, mustExist=True, newFile=False):
     if exists(path):
         if sha1Check and sha1:
             if not _sha1CachedValid() or (newFile and sha1 != _sha1Cached()):
+                logv('Create/update SHA1 cache file ' + sha1path)
                 _writeSha1Cached()
 
             if sha1 != _sha1Cached():
+                if sha1 == sha1OfFile(path):
+                    logv('Fix corrupt SHA1 cache file ' + sha1path)
+                    _writeSha1Cached()
+                    return True
                 return False
     elif mustExist:
         return False
@@ -2442,13 +2444,28 @@ Potentially long running operations should log the command. If '-v' is set
 'run'  will log the actual VC command. If '-V' is set the output from
 the command should be logged.
 '''
-class VC:
+class VC(object):
+    __metaclass__ = ABCMeta
+    """
+    base class for all supported Distriuted Version Constrol abstractions
+
+    :ivar str kind: the VC type identifier
+    :ivar str proper_name: the long name descriptor of the VCS
+    """
+
     def __init__(self, kind, proper_name):
         self.kind = kind
         self.proper_name = proper_name
 
     @staticmethod
     def is_valid_kind(kind):
+        """
+        tests if the given VCS kind is valid or not
+
+        :param str kind: the VCS kind
+        :return: True if a valid VCS kind
+        :rtype: bool
+        """
         for vcs in _vc_systems:
             if kind == vcs.kind:
                 return True
@@ -2456,11 +2473,15 @@ class VC:
 
     @staticmethod
     def get_vc(vcdir, abortOnError=True):
-        '''
-        Given that 'vcdir' is repository directory, attempt to determine
-        what kind of VC it is managed by. Return the VC instance or None if it
-        cannot be determined.
-        '''
+        """
+        Given that :param:`vcdir` is a repository directory, attempt to determine
+        what kind of VCS is it managed by. Return None if it cannot be determined.
+
+        :param str vcdir: a valid path to a version controlled directory
+        :param boo abortOnError: if an error occurs, abort mx operations
+        :return: an instance of VC or None if it cannot be determined
+        :rtype: :class:`VC`
+        """
         for vcs in _vc_systems:
             vcs.check()
             if vcs.is_this_vc(vcdir):
@@ -2509,32 +2530,55 @@ class VC:
         abort(self.kind + " commit is not implemented")
 
     def tip(self, vcdir, abortOnError=True):
-        '''
-        Return the most recent changeset for repo at vcdir.
-        Return None if fails and abortOnError=False
-        '''
+        """
+        Get the most recent changeset for repo at :param:`vcdir`.
+
+        :param str vcdir: a valid repository path
+        :param bool abortOnError: if True abort on mx error
+        :return: most recent changeset for specified repository,
+                 None if failure and :param:`abortOnError`=False
+        :rtype: str
+        """
         abort(self.kind + " tip is not implemented")
 
     def parent(self, vcdir, abortOnError=True):
-        '''
-        Return the parent changeset of the working directory for repo at vcdir.
-        Return None if fails and abortOnError=False
-        '''
+        """
+        Get the parent changeset of the working directory for repo at :param:`vcdir`.
+
+        :param str vcdir: a valid repository path
+        :param bool abortOnError: if True abort on mx error
+        :return: most recent changeset for specified repository,
+                 None if failure and :param:`abortOnError`=False
+        :rtype: str
+        """
         abort(self.kind + " id is not implemented")
 
     def release_version_from_tags(self, vcdir, prefix, snapshotSuffix='dev', abortOnError=True):
-        '''
+        """
         Returns a release version derived from VC tags that match the pattern <prefix>-<major>.<minor>
         or None if no such tags exist.
-        '''
+
+        :param str vcdir: a valid repository path
+        :param str prefix: the prefix
+        :param str snapshotSuffix: the snapshot suffix
+        :param bool abortOnError: if True abort on mx error
+        :return: a release version
+        :rtype: str
+        """
         abort(self.kind + " release_version_from_tags is not implemented")
 
     def clone(self, url, dest=None, rev=None, abortOnError=True, **extra_args):
-        '''
-        Clone the repo at url to 'dest' (None is vc specific) using 'rev' (None means tip)
-        Result is True/False for success/failure respectively.
-        'extra_args' is for subclass-specific information in/out
-        '''
+        """
+        Clone the repo at :param:`url` to :param:`dest` using :param:`rev`
+
+        :param str url: the repository url
+        :param str dest: the path to destination, if None the destination is
+                         chosen by the vcs
+        :param str rev: the desired revision, if None use tip
+        :param dict extra_args: for subclass-specific information in/out
+        :return: True if the operation is successful, False otherwise
+        :rtype: bool
+        """
         abort(self.kind + " clone is not implemented")
 
     def _log_clone(self, url, dest=None, rev=None):
@@ -2547,11 +2591,18 @@ class VC:
         log(msg)
 
     def pull(self, vcdir, rev=None, update=False, abortOnError=True):
-        '''
-        Pull a given changeset (the head if 'rev='None'), optionally updating the working directory.
-        Updating is only done if something was pulled. If there were no new changesets or rev was already
-        known locally, no update is performed.
-        '''
+        """
+        Pull a given changeset (the head if `rev` is None), optionally updating
+        the working directory. Updating is only done if something was pulled.
+        If there were no new changesets or `rev` was already known locally,
+        no update is performed.
+
+        :param str vcdir: a valid repository path
+        :param str rev: the desired revision, if None use tip
+        :param bool abortOnError: if True abort on mx error
+        :return: True if the operation is successful, False otherwise
+        :rtype: bool
+        """
         abort(self.kind + " pull is not implemented")
 
     def _log_pull(self, vcdir, rev):
@@ -2565,38 +2616,73 @@ class VC:
         log(msg)
 
     def can_push(self, vcdir, strict=True):
-        '''
-        Return True if we can push 'vcdir'.  if 'strict=True' no uncommitted changes or unadded are allowed.
-        '''
+        """
+        Check if :param:`vcdir` can be pushed.
+
+        :param str vcdir: a valid repository path
+        :param bool strict: if set no uncommitted changes or unadded are allowed
+        :return: True if we can push, False otherwise
+        :rtype: bool
+        """
 
     def default_push(self, vcdir, abortOnError=True):
-        '''
-        Return the default push target for this repo.
-        '''
+        """
+        get the default push target for this repo
+
+        :param str vcdir: a valid repository path
+        :param bool abortOnError: if True abort on mx error
+        :return: default push target for repo
+        :rtype: str
+        """
         abort(self.kind + " default_push is not implemented")
 
     def default_pull(self, vcdir, abortOnError=True):
-        '''
-        Return the default push target for this repo.
-        '''
+        """
+        get the default pull target for this repo
+
+        :param str vcdir: a valid repository path
+        :param bool abortOnError: if True abort on mx error
+        :return: default pull target for repo
+        :rtype: str
+        """
         abort(self.kind + " default_pull is not implemented")
 
     def incoming(self, vcdir, abortOnError=True):
-        '''
+        """
         list incoming changesets
-        '''
+
+        :param str vcdir: a valid repository path
+        :param bool abortOnError: if True abort on mx error
+        :return: most recent changeset for specified repository,
+                 None if failure and :param:`abortOnError`=False
+        :rtype: str
+        """
         abort(self.kind + ": outgoing is not implemented")
 
     def outgoing(self, vcdir, dest=None, abortOnError=True):
-        '''
-        list outgoing changesets to 'dest' or default-push if None
-        '''
+        """
+        llist outgoing changesets to 'dest' or default-push if None
+
+        :param str vcdir: a valid repository path
+        :param bool abortOnError: if True abort on mx error
+        :return: most recent changeset for specified repository,
+                 None if failure and :param:`abortOnError`=False
+        :rtype: str
+        """
         abort(self.kind + ": outgoing is not implemented")
 
     def push(self, vcdir, dest=None, rev=None, abortOnError=True):
-        '''
-        Push 'vcdir' at rev 'rev', to default if 'target'=None else 'target'
-        '''
+        """
+        Push :param:`vcdir` at rev :param:`rev` to default if :param:`dest`
+        is None, else push to :param:`dest`.
+
+        :param str vcdir: a valid repository path
+        :param str rev: the desired revision
+        :param str dest: the path to destination
+        :param bool abortOnError: if True abort on mx error
+        :return: True on success, False otherwise
+        :rtype: bool
+        """
         abort(self.kind + ": push is not implemented")
 
     def _log_push(self, vcdir, dest, rev):
@@ -2612,45 +2698,83 @@ class VC:
         log(msg)
 
     def update(self, vcdir, rev=None, mayPull=False, clean=False, abortOnError=True):
-        '''
-        update 'vcdir' working directory.
+        """
+        update the :param:`vcdir` working directory.
+        If :param:`rev` is not specified, update to the tip of the current branch.
+        If :param:`rev` is specified, `mayPull` controls whether a pull will be attempted if
+        :param:`rev` can not be found locally.
+        If :param:`clean` is True, uncommitted changes will be discarded (no backup!).
 
-        If 'rev' is not specified, update to the tip of the current branch.
-        If 'rev' is specified, mayPull controls whether a pull will be attempted if
-        'rev' can not be found locally.
-        If 'clean' is true, uncommitted changes will be discarded (no backup!).
-        '''
+        :param str vcdir: a valid repository path
+        :param str rev: the desired revision
+        :param bool mayPull: flag to controll whether to pull or not
+        :param bool clean: discard uncommitted changes without backing up
+        :param bool abortOnError: if True abort on mx error
+        :return: True on success, False otherwise
+        :rtype: bool
+        """
         abort(self.kind + " update is not implemented")
 
     def isDirty(self, vcdir, abortOnError=True):
-        '''
+        """
         check whether the working directory is dirty
-        '''
+
+        :param str vcdir: a valid repository path
+        :param bool abortOnError: if True abort on mx error
+        :return: True of the working directory is dirty, False otherwise
+        :rtype: bool
+        """
         abort(self.kind + " isDirty is not implemented")
 
     def locate(self, vcdir, patterns=None, abortOnError=True):
-        '''
-        Return a list of paths under vc control that match 'patterns'
-        '''
+        """
+        Return a list of paths under vc control that match :param:`patterns`
+
+        :param str vcdir: a valid repository path
+        :param patterns: a list of patterns
+        :type patterns: str or None or list
+        :param bool abortOnError: if True abort on mx error
+        :return: a list of paths under vc control
+        :rtype: list
+        """
         abort(self.kind + " locate is not implemented")
 
     def bookmark(self, vcdir, name, rev, abortOnError=True):
-        '''
+        """
         Place a bookmark at a given revision
-        '''
+
+        :param str vcdir: a valid repository path
+        :param str name: the name of the bookmark
+        :param str rev: the desired revision
+        :param bool abortOnError: if True abort on mx error
+        :return: True on success, False otherwise
+        :rtype: bool
+        """
         abort(self.kind + " bookmark is not implemented")
 
     def latest(self, vcdir, rev1, rev2, abortOnError=True):
-        '''
+        """
         Returns the latest of 2 revisions.
         The revisions should be related in the DAG.
-        '''
+
+        :param str vcdir: a valid repository path
+        :param str rev1: the first revision
+        :param str rev2: the second revision
+        :param bool abortOnError: if True abort on mx error
+        :return: the latest of the 2 revisions
+        :rtype: str or None
+        """
         abort(self.kind + " latest is not implemented")
 
     def exists(self, vcdir, rev):
-        '''
-        Returns true if a given revision exists in the repository.
-        '''
+        """
+        Check if a given revision exists in the repository.
+
+        :param str vcdir: a valid repository path
+        :param str rev: the second revision
+        :return: True if revision exists, False otherwise
+        :rtype: bool
+        """
         abort(self.kind + " exists is not implemented")
 
 
@@ -2930,7 +3054,10 @@ class HgConfig(VC):
                 return None
 
     def bookmark(self, vcdir, name, rev, abortOnError=True):
-        return run(['hg', '-R', vcdir, 'bookmark', '-r', rev, '-i', '-f', name], nonZeroIsFatal=abortOnError) == 0
+        ret = run(['hg', '-R', vcdir, 'bookmark', '-r', rev, '-i', '-f', name], nonZeroIsFatal=False)
+        if ret != 0:
+            logging = abort if abortOnError else warn
+            logging("Failed to create bookmark {0} at revision {1} in {2}".format(name, rev, vcdir))
 
     def latest(self, vcdir, rev1, rev2, abortOnError=True):
         #hg log -r 'heads(ancestors(26030a079b91) and ancestors(6245feb71195))' --template '{node}\n'
@@ -2968,221 +3095,12 @@ class GitConfig(VC):
     """
     def __init__(self):
         VC.__init__(self, 'git', 'Git')
-        self.missing = 'no git executable found'
+        self.missing = 'No Git executable found. You must install Git in order to proceed!'
         self.has_git = None
 
     def check(self, abortOnError=True):
-        # Git does lazy checking before use of the git command itself
+        # Mercurial does lazy checking before use of the git command itself
         return self
-
-    def init(self, vcdir, abortOnError=True):
-        return self.run(['git', 'init'], cwd=vcdir, nonZeroIsFatal=abortOnError) == 0
-
-    def is_this_vc(self, vcdir):
-        gitDir = join(vcdir, self.metadir())
-        # check for existence to also cover git submodules
-        return os.path.exists(gitDir)
-
-    def metadir(self):
-        return '.git'
-
-    # SCM METHODS
-
-    def add(self, vcdir, path, abortOnError=True):
-        return self.run(['git', '-C', vcdir, 'add', path]) == 0
-
-    def commit(self, vcdir, msg, abortOnError=True):
-        return self.run(['git', '-C', vcdir, 'commit', '-m', msg]) == 0
-
-    def _rev_parse(self, vcdir, rev, abortOnError=True):
-        self.check_for_git()
-        try:
-            return subprocess.check_output(['git', '-C', vcdir, 'rev-parse', rev]).strip()
-        except subprocess.CalledProcessError:
-            if abortOnError:
-                abort('git _rev_parse with ' + rev + ' failed')
-            else:
-                return None
-
-    def tip(self, vcdir, abortOnError=True):
-        info = self._getBranchInfo(vcdir, abortOnError=abortOnError)
-        check = info[1] + '/' + info[2]
-        return self._rev_parse(vcdir, check, abortOnError=abortOnError)
-
-    def parent(self, vcdir, abortOnError=True):
-        return self._rev_parse(vcdir, 'HEAD', abortOnError=abortOnError)
-
-    def clone(self, url, dest=None, rev=None, abortOnError=True, **extra_args):
-        cmd = ['git', 'clone']
-        # check out different branch
-        if extra_args and 'branch' in extra_args:
-            cmd.append('--branch')
-            cmd.append(extra_args['branch'])
-
-        cmd.append(url) # from
-        if dest:
-            cmd.append(dest) # to
-        self._log_clone(url, dest, rev)
-        out = OutputCapture()
-        rc = self.run(cmd, nonZeroIsFatal=abortOnError, out=out)
-
-        # change revision
-        if rev and rc == 0:
-            rc = rc or self.update(dest, rev=rev, abortOnError=abortOnError)
-
-        logvv(out.data)
-        return rc == 0
-
-    def pull(self, vcdir, rev=None, update=False, abortOnError=True):
-        '''
-        Uses the semantics of the hg pull here, aka. fetch in git.
-        If update is set, git merge is executed afterwards (hg update)
-        '''
-        cmd = ['git', '-C', vcdir, 'fetch']
-        self._log_pull(vcdir, rev)
-        out = OutputCapture()
-        rc = self.run(cmd, nonZeroIsFatal=abortOnError, out=out)
-        logvv(out.data)
-
-        if update:
-            rc = rc or self.update(vcdir, rev=rev, abortOnError=abortOnError)
-
-        return rc == 0
-
-    def push(self, vcdir, dest=None, rev=None, abortOnError=False):
-        '''
-        Omits the --force flag, instead pushes to branch 'mx_push'
-        to avoid overriden the master branch (if rev is specified).
-        '''
-        cmd = ['git', '-C', vcdir, 'push']
-        if dest:
-            cmd.append(dest)
-
-        if rev:
-            cmd.append(rev + ':mx_push')
-
-        self._log_push(vcdir, dest, rev)
-        out = OutputCapture()
-        rc = self.run(cmd, nonZeroIsFatal=abortOnError, out=out)
-        logvv(out.data)
-        return rc == 0
-
-    def update(self, vcdir, rev=None, mayPull=False, clean=False, abortOnError=False):
-        '''
-        Uses 'merge' if no rev is specified. This is the intended use, to update with new
-        changes. Nevertheless, if a 'rev' is specified we use checkout, as an 'rev'
-        older than the current HEAD of the local repository is expected.
-        '''
-        cmd = ['git', '-C', vcdir]
-        if not rev:
-            cmd += ['merge', 'HEAD']
-        else:
-            cmd.append('checkout')
-            if clean:
-                cmd.append('--force') # throws away uncommitted changes!!!
-            cmd.append(rev)
-
-        result = self.run(cmd, nonZeroIsFatal=abortOnError) == 0
-        if not result and mayPull and rev:
-            self.pull(vcdir, rev=rev, update=False, abortOnError=abortOnError)
-            result = self.update(vcdir, rev=rev, clean=clean, abortOnError=abortOnError)
-        return result
-
-    def incoming(self, vcdir, abortOnError=True):
-        return self._checkCommits(vcdir, incoming=True, abortOnError=abortOnError)
-
-    def outgoing(self, vcdir, dest=None, abortOnError=True):
-        '''
-        The current branch's target remote branch is taken.
-        '''
-        if dest and abortOnError:
-            abort('Specifying a destination is currently not supported.')
-
-        return self._checkCommits(vcdir, incoming=False, abortOnError=abortOnError)
-
-    # HELPER
-
-    def can_push(self, vcdir, strict=True, abortOnError=True):
-        out = OutputCapture()
-        rc = self.run(['git', '-C', vcdir, 'status', '-s'], nonZeroIsFatal=abortOnError, out=out)
-        if rc == 0:
-            output = out.data
-            if strict:
-                # no uncommitted / not added
-                return output == ''
-            else:
-                # we check for untracked files
-                if len(output) > 0:
-                    for line in output.split('\n'):
-                        if len(line) > 0 and not line.strip().startswith('?'):
-                            return False
-                return True
-        else:
-            return False
-
-    def default_push(self, vcdir, abortOnError=True):
-        return self._getRepositoryURI(vcdir, 'push', abortOnError=abortOnError)
-
-    def default_pull(self, vcdir, abortOnError=True):
-        return self._getRepositoryURI(vcdir, 'fetch', abortOnError=abortOnError)
-
-    def isDirty(self, vcdir, abortOnError=True):
-        self.check_for_git()
-        try:
-            return len(subprocess.check_output(['git', '-C', vcdir, 'status', '-s'])) > 0
-        except subprocess.CalledProcessError:
-            if abortOnError:
-                abort('failed to get status')
-            else:
-                return None
-
-    def locate(self, vcdir, patterns=None, abortOnError=True):
-        if patterns is None:
-            patterns = []
-        elif not isinstance(patterns, list):
-            patterns = [patterns]
-
-        out = LinesOutputCapture()
-        rc = self.run(['git', '-C', vcdir, 'ls-files'] + patterns, out=out, nonZeroIsFatal=False)
-        if rc == 1:
-            # git returns 1 if no matches were found
-            return []
-        elif rc == 0:
-            return [os.path.join(vcdir, l.rstrip()) for l in out.lines]
-        else:
-            if abortOnError:
-                abort('locate returned: ' + str(rc))
-            else:
-                return None
-
-    def _checkCommits(self, vcdir, incoming, abortOnError=True):
-        info = self._getBranchInfo(vcdir, abortOnError=abortOnError)
-        print info
-        if not info[1]:
-            if abortOnError:
-                abort('branch has no remote repository')
-            else:
-                return None
-
-        rc = self.run(['git', '-C', vcdir, 'fetch', info[1]])
-        if rc == 0:
-            check = info[1] + '/' + info[2]
-            check = '..' + check if incoming else check + '..'
-            print 'changes for {}'.format(check)
-            out = OutputCapture()
-            rc = rc or self.run(['git', '-C', vcdir, 'log', check], out=out)
-            return out.data if out.data != '' else 'no changes'
-
-        if rc != 0:
-            if abortOnError:
-                abort('incoming returned: ' + str(rc))
-            else:
-                return None
-
-    def run(self, *args, **kwargs):
-        # Ensure git exists before executing the command
-        self.check_for_git()
-        return run(*args, **kwargs)
 
     def check_for_git(self, abortOnError=True):
         if self.has_git is None:
@@ -3201,12 +3119,24 @@ class GitConfig(VC):
 
         return self if self.has_git else None
 
+    def run(self, *args, **kwargs):
+        # Ensure hg exists before executing the command
+        self.check_for_git()
+        return run(*args, **kwargs)
+
+    def init(self, vcdir, abortOnError=True):
+        return self.run(['git', 'init'], cwd=vcdir, nonZeroIsFatal=abortOnError) == 0
+
+    def is_this_vc(self, vcdir):
+        gitdir = join(vcdir, self.metadir())
+        return os.path.isdir(gitdir)
+
     def git_command(self, vcdir, args, abortOnError=False, quiet=False):
-        args = ['git', '-C', vcdir] + args
+        args = ['git'] + args
         if not quiet:
             print '{0}'.format(" ".join(args))
         out = OutputCapture()
-        rc = self.run(args, nonZeroIsFatal=False, out=out)
+        rc = self.run(args, cwd=vcdir, nonZeroIsFatal=False, out=out)
         if rc == 0 or rc == 1:
             return out.data
         else:
@@ -3214,54 +3144,471 @@ class GitConfig(VC):
                 abort(" ".join(args) + ' returned ' + str(rc))
             return None
 
-    def _getRepositoryURI(self, vcdir, tpe, abortOnError=True):
-        '''
-        Retrieves the url of the remote assigned for the checked out branch.
-        '''
-        info = self._getBranchInfo(vcdir)
-        if info[1]: # has remote
-            remotes = LinesOutputCapture()
-            self.run(['git', 'remote', '-v'], out=remotes)
-            for remote in remotes.lines:
-                m = re.search(info[1] + ur'\s+(.+) \(' + tpe + ur'\)', remote)
-                if m:
-                    return m.group(1).strip()
+    def add(self, vcdir, path, abortOnError=True):
+        # git add does not support quiet mode, so we capture the output instead ...
+        out = OutputCapture()
+        return self.run(['git', 'add', path], cwd=vcdir, out=out) == 0
 
-        if abortOnError:
-            abort('branch has no remote repository assigned')
+    def commit(self, vcdir, msg, abortOnError=True):
+        return self.run(['git', 'commit', '-a', '-m', msg], cwd=vcdir) == 0
+
+    def tip(self, vcdir, abortOnError=True):
+        """
+        Get the most recent changeset for repo at :param:`vcdir`.
+
+        :param str vcdir: a valid repository path
+        :param bool abortOnError: if True abort on mx error
+        :return: most recent changeset for specified repository,
+                 None if failure and :param:`abortOnError`=False
+        :rtype: str
+        """
+        self.check_for_git()
+        # We don't use run because this can be called very early before _opts is set
+        try:
+            return subprocess.check_output(['git', 'rev-list', 'HEAD', '-1'], cwd=vcdir)
+        except subprocess.CalledProcessError:
+            if abortOnError:
+                abort('git rev-list HEAD failed')
+            else:
+                return None
+
+    def parent(self, vcdir, abortOnError=True):
+        """
+        Get the parent changeset of the working directory for repo at :param:`vcdir`.
+
+        :param str vcdir: a valid repository path
+        :param bool abortOnError: if True abort on mx error
+        :return: most recent changeset for specified repository,
+                 None if failure and :param:`abortOnError`=False
+        :rtype: str
+        """
+        self.check_for_git()
+        # We don't use run because this can be called very early before _opts is set
+        if exists(join(vcdir, self.metadir(), 'MERGE_HEAD')):
+            if abortOnError:
+                abort('More than one parent exist during merge')
+            return None
+        try:
+            out = subprocess.check_output(['git', 'show', '--pretty=format:%H', "-s", 'HEAD'], cwd=vcdir)
+            return out.strip()
+        except subprocess.CalledProcessError:
+            if abortOnError:
+                abort('git show failed')
+            else:
+                return None
+
+    def _prefix(self, prefix):
+        if not prefix.endswith('-'):
+            prefix = '{}-'.format(prefix)
+        return prefix
+
+    def _tags(self, vcdir, prefix, abortOnError=True):
+        # git -C . tag -l prefix-*
+        prefix = self._prefix(prefix)
+        try:
+            tags_out = subprocess.check_output(['git', 'tag', '--sort=refname', '-l', '{0}*'.format(prefix)], cwd=vcdir)
+            return tags_out.strip().split('\n')
+        except subprocess.CalledProcessError as e:
+            if abortOnError:
+                abort('git tag failed: ' + str(e))
+            else:
+                return None
+
+    def _tag_revision(self, vcdir, tag, abortOnError=True):
+        # git -C . show -s --format="%H" TAG
+        try:
+            tag_rev = subprocess.check_output(['git', 'show', '-s', '--format="%H"', tag], cwd=vcdir)
+            return tag_rev.strip()
+        except subprocess.CalledProcessError as e:
+            if abortOnError:
+                abort('git show failed: ' + str(e))
+            else:
+                return None
+
+    def _latest_revision(self, vcdir, abortOnError=True):
+        # git log -n 1 --format="%H"
+        try:
+            latest_rev = subprocess.check_output(['git', 'log', '-n', '1', '--format="%H"'], cwd=vcdir)
+            return latest_rev.strip()
+        except subprocess.CalledProcessError as e:
+            if abortOnError:
+                abort('git log failed: ' + str(e))
+            else:
+                return None
+
+
+    def release_version_from_tags(self, vcdir, prefix, snapshotSuffix='dev', abortOnError=True):
+        """
+        Returns a release version derived from VC tags that match the pattern <prefix>-<major>.<minor>
+        or None if no such tags exist.
+
+        :param str vcdir: a valid repository path
+        :param str prefix: the prefix
+        :param str snapshotSuffix: the snapshot suffix
+        :param bool abortOnError: if True abort on mx error
+        :return: a release version
+        :rtype: str
+        """
+        matching_tags = self._tags(vcdir, prefix, abortOnError=abortOnError)
+        matching_tags = [(tag, self._tag_revision(vcdir, tag, abortOnError=abortOnError))
+                          for tag in matching_tags]
+        latest_rev = self._latest_revision(vcdir, abortOnError=abortOnError)
+        if latest_rev and matching_tags:
+            prefix = self._prefix(prefix)
+            most_recent_tag, most_recent_rev = matching_tags[0]
+            version = most_recent_tag[len(prefix):].split('.')
+            version = map(int, version)
+
+            if latest_rev == most_recent_rev:
+                return '.'.join(map(str, version))
+            else:
+                major, minor = version
+                return '{0}.{1}-{2}'.format(major, minor, snapshotSuffix)
+        return None
+
+    def metadir(self):
+        return '.git'
+
+    def _clone(self, url, dest=None, abortOnError=True, **extra_args):
+        cmd = ['git', 'clone']
+        cmd.append(url)
+        if dest:
+            cmd.append(dest)
+        self._log_clone(url, dest)
+        out = OutputCapture()
+        rc = self.run(cmd, nonZeroIsFatal=abortOnError, out=out)
+        logvv(out.data)
+        return rc == 0
+
+    def _reset_rev(self, rev, dest=None, abortOnError=True, **extra_args):
+        cmd = ['git']
+        cwd = None if dest is None else dest
+        cmd.extend(['reset', '--hard', rev])
+        out = OutputCapture()
+        rc = self.run(cmd, nonZeroIsFatal=abortOnError, cwd=cwd, out=out)
+        logvv(out.data)
+        return rc == 0
+
+    def clone(self, url, dest=None, rev=None, abortOnError=True, **extra_args):
+        """
+        Clone the repo at :param:`url` to :param:`dest` using :param:`rev`
+
+        :param str url: the repository url
+        :param str dest: the path to destination, if None the destination is
+                         chosen by the vcs
+        :param str rev: the desired revision, if None use tip
+        :param dict extra_args: for subclass-specific information in/out
+        :return: True if the operation is successful, False otherwise
+        :rtype: bool
+        """
+        # TODO: speedup git clone
+        # git clone git://source.winehq.org/git/wine.git ~/wine-git --depth 1
+        # downsides: This parameter will have the effect of preventing you from
+        # cloning it or fetching from it, and other repositories will be unable
+        # to push to you, and you won't be able to push to other repositories.
+        self._log_clone(url, dest, rev)
+        success = self._clone(url, dest=dest, abortOnError=abortOnError, **extra_args)
+        if success and rev:
+            success = self._reset_rev(rev, dest=dest, abortOnError=abortOnError, **extra_args)
+            if not success:
+                #TODO: should the cloned repo be removed from disk if the reset op failed?
+                log('reset revision failed, removing {0}'.format(dest))
+                shutil.rmtree(os.path.abspath(dest))
+        return success
+
+    def _fetch(self, vcdir, abortOnError=True):
+        try:
+            return subprocess.check_call(['git', 'fetch'], cwd=vcdir)
+        except subprocess.CalledProcessError:
+            if abortOnError:
+                abort('git fetch failed')
+            else:
+                return None
+
+    def _log_changes(self, vcdir, path=None, incoming=True, abortOnError=True):
+        out = OutputCapture()
+        cmd = ['git', 'log', '{0}origin/master{1}'.format(
+                ('..', '') if incoming else ('', '..'))]
+        if path:
+            cmd.extend(['--', path])
+        rc = self.run(cmd, nonZeroIsFatal=False, cwd=vcdir, out=out)
+        if rc == 0 or rc == 1:
+            return out.data
         else:
+            if abortOnError:
+                abort('{0} returned {1}'.format(
+                        'incoming' if incoming else 'outgoing', str(rc)))
             return None
 
-    def _getBranchInfo(self, vcdir, abortOnError=True):
-        '''
-        Returns the triple: (<local branch name>, <remote name>, <tracked remote branch name>).
-        If the branch tacks no remote branch, remote name and branch are 'None'.
-        '''
-        branches = LinesOutputCapture()
-        self.run(['git', '-C', vcdir, 'branch', '-vv'], out=branches)
-        for branch in branches.lines:
-            local = re.search(ur'\*\s+(\S+).+', branch) # current branch name
-            if local:
-                remote = re.search(ur'.+\[(\S+)\/(\S+)[:.+\]|\]] .+', branch) # check for remote
-                if remote:
-                    return (local.group(1), remote.group(1), remote.group(2))
-                else:
-                    return (local.group(1), None, None) # current branch has no upstream set
-        if abortOnError:
-            abort('illegal state: no branch found')
+    def incoming(self, vcdir, abortOnError=True):
+        """
+        list incoming changesets
+
+        :param str vcdir: a valid repository path
+        :param bool abortOnError: if True abort on mx error
+        :return: most recent changeset for specified repository,
+                 None if failure and :param:`abortOnError`=False
+        :rtype: str
+        """
+        rc = self._fetch(vcdir, abortOnError=abortOnError)
+        if rc:
+            return self._log_changes(vcdir, incoming=True, abortOnError=abortOnError)
         else:
+            if abortOnError:
+                abort('incoming returned ' + str(rc))
             return None
 
+    def outgoing(self, vcdir, dest=None, abortOnError=True):
+        """
+        llist outgoing changesets to 'dest' or default-push if None
 
-    # Not yet implemented / applicable
+        :param str vcdir: a valid repository path
+        :param bool abortOnError: if True abort on mx error
+        :return: most recent changeset for specified repository,
+                 None if failure and :param:`abortOnError`=False
+        :rtype: str
+        """
+        rc = self._fetch(vcdir, abortOnError=abortOnError)
+        if rc:
+            return self._log_changes(vcdir, path=dest, incoming=False, abortOnError=abortOnError)
+        else:
+            if abortOnError:
+                abort('outgoing returned ' + str(rc))
+            return None
 
-    # def release_version_from_tags(self, vcdir, prefix, snapshotSuffix='dev', abortOnError=True):
+    def pull(self, vcdir, rev=None, update=False, abortOnError=True):
+        """
+        Pull a given changeset (the head if `rev` is None), optionally updating
+        the working directory. Updating is only done if something was pulled.
+        If there were no new changesets or `rev` was already known locally,
+        no update is performed.
 
-    # def bookmark(self, vcdir, name, rev, abortOnError=True):
+        :param str vcdir: a valid repository path
+        :param str rev: the desired revision, if None use tip
+        :param bool abortOnError: if True abort on mx error
+        :return: True if the operation is successful, False otherwise
+        :rtype: bool
+        """
+        cmd = ['git', 'pull', 'origin']
+        if rev:
+            cmd.append(rev)
+        self._log_pull(vcdir, rev)
+        out = OutputCapture()
+        rc = self.run(cmd, nonZeroIsFatal=abortOnError, cwd=vcdir, out=out)
+        logvv(out.data)
+        return rc == 0
 
-    # def latest(self, vcdir, rev1, rev2, abortOnError=True):
+    def can_push(self, vcdir, strict=True, abortOnError=True):
+        """
+        Check if :param:`vcdir` can be pushed.
 
-    # def exists(self, vcdir, rev):
+        :param str vcdir: a valid repository path
+        :param bool strict: if set no uncommitted changes or unadded are allowed
+        :return: True if we can push, False otherwise
+        :rtype: bool
+        """
+        out = OutputCapture()
+        rc = self.run(['git', 'status', '--porcelain'], cwd=vcdir, nonZeroIsFatal=abortOnError, out=out)
+        if rc == 0:
+            output = out.data
+            if strict:
+                return output == ''
+            else:
+                if len(output) > 0:
+                    for line in output.split('\n'):
+                        if len(line) > 0 and not line.startswith('??'):
+                            return False
+                return True
+        else:
+            return False
+
+    def _path(self, vcdir, name, abortOnError=True):
+        out = OutputCapture()
+        rc = self.run(['git', 'remove', '-v'], cwd=vcdir, nonZeroIsFatal=abortOnError, out=out)
+        if rc == 0:
+            output = out.data
+            suffix = '({0})'.format(name)
+            for line in output.split(os.linesep):
+                if line.strip().endswith(suffix):
+                    return line.split()[1]
+        if abortOnError:
+            abort("no '{0}' path for repository {1}".format(name, vcdir))
+        return None
+
+    def default_push(self, vcdir, abortOnError=True):
+        """
+        get the default push target for this repo
+
+        :param str vcdir: a valid repository path
+        :param bool abortOnError: if True abort on mx error
+        :return: default push target for repo
+        :rtype: str
+        """
+        push = self._path(vcdir, 'push', abortOnError=False)
+        if push:
+            return push
+        return self.default_pull(vcdir, abortOnError=abortOnError)
+
+    def default_pull(self, vcdir, abortOnError=True):
+        """
+        get the default pull target for this repo
+
+        :param str vcdir: a valid repository path
+        :param bool abortOnError: if True abort on mx error
+        :return: default pull target for repo
+        :rtype: str
+        """
+        return self._path(vcdir, 'fetch', abortOnError=abortOnError)
+
+    def push(self, vcdir, dest=None, rev=None, abortOnError=False):
+        """
+        Push :param:`vcdir` at rev :param:`rev` to default if :param:`dest`
+        is None, else push to :param:`dest`.
+
+        :param str vcdir: a valid repository path
+        :param str rev: the desired revision
+        :param str dest: the path to destination
+        :param bool abortOnError: if True abort on mx error
+        :return: True on success, False otherwise
+        :rtype: bool
+        """
+        cmd = ['git', 'push']
+        cmd.append(dest if dest else 'origin')
+        cmd.append('{0}master'.format('{0}:'.format(rev) if rev else ''))
+        self._log_push(vcdir, dest, rev)
+        out = OutputCapture()
+        rc = self.run(cmd, cwd=vcdir, nonZeroIsFatal=abortOnError, out=out)
+        logvv(out.data)
+        return rc == 0
+
+    def update(self, vcdir, rev=None, mayPull=False, clean=False, abortOnError=False):
+        """
+        update the :param:`vcdir` working directory.
+        If :param:`rev` is not specified, update to the tip of the current branch.
+        If :param:`rev` is specified, `mayPull` controls whether a pull will be attempted if
+        :param:`rev` can not be found locally.
+        If :param:`clean` is True, uncommitted changes will be discarded (no backup!).
+
+        :param str vcdir: a valid repository path
+        :param str rev: the desired revision
+        :param bool mayPull: flag to controll whether to pull or not
+        :param bool clean: discard uncommitted changes without backing up
+        :param bool abortOnError: if True abort on mx error
+        :return: True on success, False otherwise
+        :rtype: bool
+        """
+        if rev and mayPull and not self.exists(vcdir, rev):
+            self.pull(vcdir, rev=rev, update=False, abortOnError=abortOnError)
+        cmd = ['git', 'checkout']
+        if rev:
+            cmd.extend([rev])
+        else:
+            cmd.extend(['master'])
+        if clean:
+            cmd.append('-f')
+        return self.run(cmd, cwd=vcdir, nonZeroIsFatal=abortOnError) == 0
+
+    def locate(self, vcdir, patterns=None, abortOnError=True):
+        """
+        Return a list of paths under vc control that match :param:`patterns`
+
+        :param str vcdir: a valid repository path
+        :param patterns: a list of patterns
+        :type patterns: str or list or None
+        :param bool abortOnError: if True abort on mx error
+        :return: a list of paths under vc control
+        :rtype: list
+        """
+        if patterns is None:
+            patterns = []
+        elif not isinstance(patterns, list):
+            patterns = [patterns]
+        patterns = ['"{0}"'.format(pattern) for pattern in patterns]
+        out = LinesOutputCapture()
+        rc = self.run(['git', 'ls-files'] + patterns, cwd=vcdir, out=out, nonZeroIsFatal=False)
+        if rc == 0:
+            return out.lines
+        else:
+            if abortOnError:
+                abort('locate returned: ' + str(rc))
+            else:
+                return None
+
+    def isDirty(self, vcdir, abortOnError=True):
+        """
+        check whether the working directory is dirty
+
+        :param str vcdir: a valid repository path
+        :param bool abortOnError: if True abort on mx error
+        :return: True of the working directory is dirty, False otherwise
+        :rtype: bool
+        """
+        self.check_for_git()
+        try:
+            output = subprocess.check_output(['git', 'status', '--porcelain'], cwd=vcdir)
+            return len(output.strip()) > 0
+        except subprocess.CalledProcessError:
+            if abortOnError:
+                abort('failed to get status')
+            else:
+                return None
+
+    def bookmark(self, vcdir, name, rev, abortOnError=True):
+        """
+        Place a bookmark at a given revision
+
+        :param str vcdir: a valid repository path
+        :param str name: the name of the bookmark
+        :param str rev: the desired revision
+        :param bool abortOnError: if True abort on mx error
+        :return: True on success, False otherwise
+        :rtype: bool
+        """
+        return run(['git', 'branch', '-f', name, rev], cwd=vcdir, nonZeroIsFatal=abortOnError) == 0
+
+    def latest(self, vcdir, rev1, rev2, abortOnError=True):
+        """
+        Returns the latest of 2 revisions (in chronological order).
+        The revisions should be related in the DAG.
+
+        :param str vcdir: a valid repository path
+        :param str rev1: the first revision
+        :param str rev2: the second revision
+        :param bool abortOnError: if True abort on mx error
+        :return: the latest of the 2 revisions
+        :rtype: str or None
+        """
+        self.check_for_git()
+        try:
+            out = subprocess.check_output(['git', 'rev-list', '-n', '1', '--date-order', rev1, rev2], cwd=vcdir)
+            changesets = out.strip().split('\n')
+            if len(changesets) != 1:
+                if abortOnError:
+                    abort('git rev-list returned {0} possible latest (expected 1)'.format(len(changesets)))
+                return None
+            return changesets[0]
+        except subprocess.CalledProcessError:
+            if abortOnError:
+                abort('latest failed')
+            else:
+                return None
+
+    def exists(self, vcdir, rev):
+        """
+        Check if a given revision exists in the repository.
+
+        :param str vcdir: a valid repository path
+        :param str rev: the second revision
+        :return: True if revision exists, False otherwise
+        :rtype: bool
+        """
+        self.check_for_git()
+        try:
+            out = subprocess.check_output(['git', 'show', '--format=oneline', '-s', rev], cwd=vcdir)
+            return out.strip().startswith(rev)
+        except subprocess.CalledProcessError:
+            abort('exists failed')
+
 
 
 class BinaryVC(VC):
@@ -3723,7 +4070,7 @@ def _tmpPomFile(dist, versionGetter, validateMetadata='none'):
     tmp.close()
     return tmp.name
 
-def _deploy_binary_maven(suite, name, jarPath, version, repositoryId, repositoryUrl, srcPath=None, description=None, settingsXml=None, extension='jar', dryRun=False, pomFile=None, gpg=False, keyid=None):
+def _deploy_binary_maven(suite, name, jarPath, version, repositoryId, repositoryUrl, srcPath=None, description=None, settingsXml=None, extension='jar', dryRun=False, pomFile=None, gpg=False, keyid=None, javadocPath=None):
     assert exists(jarPath)
     assert not srcPath or exists(srcPath)
 
@@ -3747,7 +4094,7 @@ def _deploy_binary_maven(suite, name, jarPath, version, repositoryId, repository
         cmd += ['deploy:deploy-file']
 
     if keyid:
-        cmd += ['-Dkeyname=' + keyid]
+        cmd += ['-Dgpg.keyname=' + keyid]
 
     cmd += ['-DrepositoryId=' + repositoryId,
         '-Durl=' + repositoryUrl,
@@ -3764,6 +4111,8 @@ def _deploy_binary_maven(suite, name, jarPath, version, repositoryId, repository
 
     if srcPath:
         cmd.append('-Dsources=' + srcPath)
+    if javadocPath:
+        cmd.append('-Djavadoc=' + javadocPath)
 
     if description:
         cmd.append('-Ddescription=' + description)
@@ -3811,7 +4160,7 @@ def deploy_binary(args):
         abort('Current prinary suite has no version control')
     _mvn.check()
     def _versionGetter(suite):
-        return '{0}-SNAPSHOT'.format(suite.vc.parent(s.dir))
+        return '{0}-SNAPSHOT'.format(suite.vc.parent(suite.dir))
     dists = s.dists
     if args.only:
         only = args.only.split(',')
@@ -3833,7 +4182,7 @@ def deploy_binary(args):
     _deploy_binary_maven(s, _map_to_maven_dist_name(mxMetaName), mxMetaJar, version, repo.name, repo.url, settingsXml=args.settings, dryRun=args.dry_run)
     _maven_deploy_dists(dists, _versionGetter, repo.name, repo.url, args.settings, dryRun=args.dry_run, licenses=repo.licenses)
 
-def _maven_deploy_dists(dists, versionGetter, repository_id, url, settingsXml, dryRun=False, validateMetadata='none', licenses=None, gpg=False, keyid=None):
+def _maven_deploy_dists(dists, versionGetter, repository_id, url, settingsXml, dryRun=False, validateMetadata='none', licenses=None, gpg=False, keyid=None, generateJavadoc=False):
     if licenses is None:
         licenses = []
     for dist in dists:
@@ -3846,8 +4195,39 @@ def _maven_deploy_dists(dists, versionGetter, repository_id, url, settingsXml, d
             if _opts.very_verbose or (dryRun and _opts.verbose):
                 with open(pomFile) as f:
                     log(f.read())
+            javadocPath = None
+            if generateJavadoc:
+                projects = [p for p in dist.archived_deps() if p.isJavaProject()]
+                tmpDir = tempfile.mkdtemp(prefix='mx-javadoc')
+                javadocArgs = ['--base', tmpDir, '--unified', '--projects', ','.join((p.name for p in projects))]
+                if dist.javadocType == 'implementation':
+                    javadocArgs += ['--implementation']
+                else:
+                    assert dist.javadocType == 'api'
+                if dist.allowsJavadocWarnings:
+                    javadocArgs += ['--allow-warnings']
+                javadoc(javadocArgs, includeDeps=False, mayBuild=False, quietForNoPackages=True)
+                tmpJavadocJar = tempfile.NamedTemporaryFile('w', suffix='.jar', delete=False)
+                tmpJavadocJar.close()
+                javadocPath = tmpJavadocJar.name
+                emptyJavadoc = True
+                with zipfile.ZipFile(javadocPath, 'w') as arc:
+                    javadocDir = join(tmpDir, 'javadoc')
+                    for (dirpath, _, filenames) in os.walk(javadocDir):
+                        for filename in filenames:
+                            emptyJavadoc = False
+                            src = join(dirpath, filename)
+                            dst = os.path.relpath(src, javadocDir)
+                            arc.write(src, dst)
+                shutil.rmtree(tmpDir)
+                if emptyJavadoc:
+                    javadocPath = None
+                    warn('Javadoc for {0} was empty'.format(dist.name))
             _deploy_binary_maven(dist.suite, _map_to_maven_dist_name(dist.remoteName()), dist.prePush(dist.path), versionGetter(dist.suite), repository_id, url, srcPath=dist.prePush(dist.sourcesPath), settingsXml=settingsXml, extension=dist.remoteExtension(),
-                dryRun=dryRun, pomFile=pomFile, gpg=gpg, keyid=keyid)
+                dryRun=dryRun, pomFile=pomFile, gpg=gpg, keyid=keyid, javadocPath=javadocPath)
+            os.unlink(pomFile)
+            if javadocPath:
+                os.unlink(javadocPath)
         elif dist.isTARDistribution():
             _deploy_binary_maven(dist.suite, _map_to_maven_dist_name(dist.remoteName()), dist.prePush(dist.path), versionGetter(dist.suite), repository_id, url, settingsXml=settingsXml, extension=dist.remoteExtension(), dryRun=dryRun, gpg=gpg, keyid=keyid)
         else:
@@ -3918,8 +4298,10 @@ def maven_deploy(args):
             abort("Repositories are not supported in {}'s suite version".format(s.name))
         repo = repository(args.repository_id)
 
+    generateJavadoc = s.getMxCompatibility().mavenDeployJavadoc()
+
     log('Deploying {0} distributions for version {1}'.format(s.name, _versionGetter(s)))
-    _maven_deploy_dists(dists, _versionGetter, repo.name, repo.url, args.settings, dryRun=args.dry_run, validateMetadata=args.validate, licenses=repo.licenses, gpg=args.gpg, keyid=args.gpg_keyid)
+    _maven_deploy_dists(dists, _versionGetter, repo.name, repo.url, args.settings, dryRun=args.dry_run, validateMetadata=args.validate, licenses=repo.licenses, gpg=args.gpg, keyid=args.gpg_keyid, generateJavadoc=generateJavadoc)
 
 class MavenConfig:
     def __init__(self):
@@ -4076,6 +4458,7 @@ class SuiteImport:
         self.version = version
         self.urlinfos = [] if urlinfos is None else urlinfos
         self.dynamicImport = dynamicImport
+        self.kind = kind
 
     @staticmethod
     def parse_specification(import_dict, context, dynamicImport=False):
@@ -4089,7 +4472,7 @@ class SuiteImport:
         if not isinstance(urls, list):
             abort('suite import urls must be a list', context=context)
         urlinfos = []
-        kind = None
+        mainKind = None
         for urlinfo in urls:
             if isinstance(urlinfo, dict) and urlinfo.get('url') and urlinfo.get('kind'):
                 kind = urlinfo.get('kind')
@@ -4098,8 +4481,11 @@ class SuiteImport:
             else:
                 abort('suite import url must be a dict with {"url", kind", attributes', context=context)
             vc = vc_system(kind)
+            if kind != 'binary':
+                assert not mainKind, "Only expecting one non-binary kind"
+                mainKind = kind
             urlinfos.append(SuiteImportURLInfo(urlinfo.get('url'), kind, vc))
-        return SuiteImport(name, version, urlinfos, kind, dynamicImport=dynamicImport)
+        return SuiteImport(name, version, urlinfos, mainKind, dynamicImport=dynamicImport)
 
     @staticmethod
     def get_source_urls(source, kind=None):
@@ -4182,7 +4568,12 @@ class Suite:
         suite such as class files and annotation generated sources should be placed.
         '''
         if not self._outputRoot:
-            self._outputRoot = self.getMxCompatibility().getSuiteOutputRoot(self)
+            suiteDict = self.suiteDict
+            outputRoot = suiteDict.get('outputRoot')
+            if outputRoot:
+                self._outputRoot = os.path.realpath(_make_absolute(outputRoot.replace('/', os.sep), self.dir))
+            else:
+                self._outputRoot = self.getMxCompatibility().getSuiteOutputRoot(self)
         return self._outputRoot
 
     def get_mx_output_dir(self):
@@ -4368,11 +4759,6 @@ class Suite:
         if suiteDict.get('name') is None:
             abort('Missing "suite=<name>" in ' + self.suite_py())
 
-        outputRoot = suiteDict.get('outputRoot')
-        if outputRoot:
-            assert not self._outputRoot or self._outputRoot == outputRoot, self._outputRoot
-            self._outputRoot = os.path.realpath(_make_absolute(outputRoot.replace('/', os.sep), self.dir))
-
         libsMap = self._check_suiteDict('libraries')
         jreLibsMap = self._check_suiteDict('jrelibraries')
         jdkLibsMap = self._check_suiteDict('jdklibraries')
@@ -4538,7 +4924,9 @@ class Suite:
             mainClass = attrs.pop('mainClass', None)
             distDeps = Suite._pop_list(attrs, 'distDependencies', context)
             javaCompliance = attrs.pop('javaCompliance', None)
-            d = JARDistribution(self, name, subDir, path, sourcesPath, deps, mainClass, exclLibs, distDeps, javaCompliance, platformDependent, theLicense)
+            javadocType = attrs.pop('javadocType', 'implementation')
+            allowsJavadocWarnings = attrs.pop('allowsJavadocWarnings', False)
+            d = JARDistribution(self, name, subDir, path, sourcesPath, deps, mainClass, exclLibs, distDeps, javaCompliance, platformDependent, theLicense, javadocType=javadocType, allowsJavadocWarnings=allowsJavadocWarnings)
         d.__dict__.update(attrs)
         self.dists.append(d)
         return d
@@ -4844,6 +5232,8 @@ def _resolve_suite_version_conflict(suiteName, existingSuite, existingVersion, e
         warn("mismatched import versions on '{}' in '{}' ({}) and '{}' ({})".format(suiteName, otherImportingSuite.name, otherImport.version, existingImporter.name if existingImporter else '?', existingVersion))
         return None
     elif conflict_resolution == 'latest':
+        if existingSuite.vc.kind != otherImport.kind:
+            return None
         if not existingSuite:
             return None # can not resolve at the moment
         if not isinstance(existingSuite, SourceSuite):
@@ -4909,6 +5299,11 @@ class SourceSuite(Suite):
             os_arch = Suite._pop_os_arch(attrs, context)
             Suite._merge_os_arch_attrs(attrs, os_arch, context)
             deps = Suite._pop_list(attrs, 'dependencies', context)
+            genDeps = Suite._pop_list(attrs, 'generatedDependencies', context)
+            if genDeps:
+                deps += genDeps
+                # Re-add generatedDependencies attribute so it can be used in canonicalizeprojects
+                attrs['generatedDependencies'] = genDeps
             workingSets = attrs.pop('workingSets', None)
             jlintOverrides = attrs.pop('lint.overrides', None)
             if className:
@@ -5074,6 +5469,28 @@ class SourceSuite(Suite):
                 mxDirBase = basename(self.mxDir)
                 arc.zf.write(pyfile, arcname=join(mxDirBase, basename(pyfile)))
 
+    def eclipse_settings_sources(self):
+        """
+        Gets a dictionary from the name of an Eclipse settings file to
+        the list of files providing its generated content, in overriding order
+        (i.e., settings from files later in the list override settings from
+        files earlier in the list).
+        A new dictionary is created each time this method is called so it's
+        safe for the caller to modify it.
+        """
+        esdict = {}
+        # start with the mxtool defaults
+        defaultEclipseSettingsDir = join(_mx_suite.dir, 'eclipse-settings')
+        if exists(defaultEclipseSettingsDir):
+            for name in os.listdir(defaultEclipseSettingsDir):
+                esdict[name] = [os.path.abspath(join(defaultEclipseSettingsDir, name))]
+
+        # append suite overrides
+        eclipseSettingsDir = join(self.mxDir, 'eclipse-settings')
+        if exists(eclipseSettingsDir):
+            for name in os.listdir(eclipseSettingsDir):
+                esdict.setdefault(name, []).append(os.path.abspath(join(eclipseSettingsDir, name)))
+        return esdict
 
 '''
 A pre-built suite downloaded from a Maven repository.
@@ -6020,9 +6437,7 @@ class JDKFactory(object):
 def addJDKFactory(tag, compliance, factory):
     assert tag != DEFAULT_JDK_TAG
     complianceMap = _jdkFactories.setdefault(tag, {})
-    assert compliance not in complianceMap
     complianceMap[compliance] = factory
-
 
 def _getJDKFactory(tag, compliance):
     if tag not in _jdkFactories:
@@ -6412,6 +6827,8 @@ def _sorted_unique_jdk_configs(configs):
     return sorted(unique_configs, cmp=_compare_configs, reverse=True)
 
 def is_interactive():
+    if get_env('CONTINUOUS_INTEGRATION'):
+        return False
     return sys.__stdin__.isatty()
 
 def _filtered_jdk_configs(candidates, versionCheck, warn=False, source=None):
@@ -6433,9 +6850,18 @@ def _find_jdk_in_candidates(candidates, versionCheck, warn=False, source=None):
     return None
 
 def find_classpath_arg(vmArgs):
-    for index in range(len(vmArgs)):
+    """
+    Searches for the last class path argument in `vmArgs` and returns its
+    index and value as a tuple. If no class path argument is found, then
+    the tuple (None, None) is returned.
+    """
+    # If the last argument is '-cp' or '-classpath' then it is not
+    # valid since the value is missing. As such, we ignore the
+    # last argument.
+    for index in reversed(range(len(vmArgs) - 1)):
         if vmArgs[index] in ['-cp', '-classpath']:
             return index + 1, vmArgs[index + 1]
+    return None, None
 
 _java_command_default_jdk_tag = None
 
@@ -7288,7 +7714,8 @@ def build(args, parser=None):
         names = args.only.split(',')
         roots = [dependency(name) for name in names]
     elif args.dependencies is not None:
-        assert args.dependencies
+        if len(args.dependencies) == 0:
+            abort('The value of the --dependencies argument cannot be the empty string')
         names = args.dependencies.split(',')
         roots = [dependency(name) for name in names]
     else:
@@ -7665,21 +8092,21 @@ def pylint(args):
     rcfile = join(dirname(__file__), '.pylintrc')
     if not exists(rcfile):
         log('pylint configuration file does not exist: ' + rcfile)
-        return
+        return -1
 
     try:
         output = subprocess.check_output(['pylint', '--version'], stderr=subprocess.STDOUT)
         m = re.match(r'.*pylint (\d+)\.(\d+)\.(\d+).*', output, re.DOTALL)
         if not m:
             log('could not determine pylint version from ' + output)
-            return
+            return -1
         major, minor, micro = (int(m.group(1)), int(m.group(2)), int(m.group(3)))
         if major != 1 or minor != 1:
             log('require pylint version = 1.1.x (got {0}.{1}.{2})'.format(major, minor, micro))
-            return
-    except BaseException:
-        log('pylint is not available')
-        return
+            return -1
+    except BaseException as e:
+        log('pylint is not available: ' + str(e))
+        return -1
 
     def findfiles_by_walk(pyfiles):
         for suite in suites(True, includeBinary=False):
@@ -7730,6 +8157,8 @@ def pylint(args):
     for pyfile in pyfiles:
         log('Running pylint on ' + pyfile + '...')
         run(['pylint', '--reports=n', '--rcfile=' + rcfile, pyfile], env=env)
+
+    return 0
 
 """
 Utility for creating and updating a zip or tar file atomically.
@@ -7861,9 +8290,16 @@ def canonicalizeprojects(args):
                             ignoredDeps.discard(dep)
                         if pkg in dep.extended_java_packages():
                             ignoredDeps.discard(dep)
+
+            genDeps = frozenset([dependency(name, context=p) for name in getattr(p, "generatedDependencies", [])])
+            incorrectGenDeps = genDeps - ignoredDeps
+            ignoredDeps -= genDeps
+            if incorrectGenDeps:
+                p.abort('{0} should declare following as normal dependencies, not generatedDependencies: {1}'.format(p, ', '.join([d.name for d in incorrectGenDeps])))
+
             if len(ignoredDeps) != 0:
                 candidates = set()
-                # Compute dependencies based on projects required by p
+                # Compute candidate dependencies based on projects required by p
                 for d in dependencies():
                     if d.isJavaProject() and not d.defined_java_packages().isdisjoint(p.imported_java_packages()):
                         candidates.add(d)
@@ -7872,7 +8308,9 @@ def canonicalizeprojects(args):
                     c.walk_deps(visit=lambda dep, edge: candidates.discard(dep) if dep.isJavaProject() else None)
                 candidates = [d.name for d in candidates]
 
-                p.abort('{0} does not use any packages defined in these projects: {1}\nComputed project dependencies: {2}'.format(
+                msg = 'Non-generated source code in {0} does not use any packages defined in these projects: {1}\nIf the above projects are only ' \
+                        'used in generated sources, declare them in a "generatedDependencies" attribute of {0}.\nComputed project dependencies: {2}'
+                p.abort(msg.format(
                     p, ', '.join([d.name for d in ignoredDeps]), ','.join(candidates)))
 
             excess = frozenset([d for d in p.deps if d.isJavaProject()]) - set(p.canonical_deps())
@@ -8433,6 +8871,19 @@ def _convert_to_eclipse_supported_compliance(compliance):
         return JavaCompliance("1.8")
     return compliance
 
+def _get_eclipse_output_path(p, linkedResources=None):
+    """
+    Gets the Eclipse path attribute value for the output of project `p`.
+    """
+    outputDirRel = p.output_dir(relative=True)
+    if outputDirRel.startswith('..'):
+        outputDirName = basename(outputDirRel)
+        if linkedResources is not None:
+            linkedResources.append(_eclipse_linked_resource(outputDirName, '2', p.output_dir()))
+        return outputDirName
+    else:
+        return outputDirRel
+
 def _eclipseinit_project(p, files=None, libFiles=None):
     eclipseJavaCompliance = _convert_to_eclipse_supported_compliance(p.javaCompliance)
 
@@ -8448,8 +8899,8 @@ def _eclipseinit_project(p, files=None, libFiles=None):
         ensure_dir_exists(srcDir)
         out.element('classpathentry', {'kind' : 'src', 'path' : src})
 
-    processorPath = p.annotation_processors_path()
-    if processorPath:
+    processors = p.annotation_processors()
+    if processors:
         genDir = p.source_gen_dir()
         ensure_dir_exists(genDir)
         if not genDir.startswith(p.dir):
@@ -8527,13 +8978,8 @@ def _eclipseinit_project(p, files=None, libFiles=None):
     for dep in sorted(projectDeps):
         out.element('classpathentry', {'combineaccessrules' : 'false', 'exported' : 'true', 'kind' : 'src', 'path' : '/' + dep.name})
 
-    outputDirRel = p.output_dir(relative=True)
-    if outputDirRel.startswith('..'):
-        outputDirName = basename(outputDirRel)
-        out.element('classpathentry', {'kind' : 'output', 'path' : outputDirName})
-        linkedResources.append(_eclipse_linked_resource(outputDirName, '2', p.output_dir()))
-    else:
-        out.element('classpathentry', {'kind' : 'output', 'path' : outputDirRel})
+
+    out.element('classpathentry', {'kind' : 'output', 'path' : _get_eclipse_output_path(p, linkedResources)})
     out.close('classpath')
     classpathFile = join(p.dir, '.classpath')
     update_file(classpathFile, out.xml(indent='\t', newl='\n'))
@@ -8633,18 +9079,22 @@ def _eclipseinit_project(p, files=None, libFiles=None):
             with open(source) as f:
                 print >> out, f.read()
         content = out.getvalue().replace('${javaCompliance}', str(eclipseJavaCompliance))
-        if processorPath:
+        if processors:
             content = content.replace('org.eclipse.jdt.core.compiler.processAnnotations=disabled', 'org.eclipse.jdt.core.compiler.processAnnotations=enabled')
         update_file(join(settingsDir, name), content)
         if files:
             files.append(join(settingsDir, name))
 
-    if processorPath:
+    if processors:
         out = XMLDoc()
         out.open('factorypath')
         out.element('factorypathentry', {'kind' : 'PLUGIN', 'id' : 'org.eclipse.jst.ws.annotations.core', 'enabled' : 'true', 'runInBatchMode' : 'false'})
-        for e in processorPath.split(os.pathsep):
-            out.element('factorypathentry', {'kind' : 'EXTJAR', 'id' : e, 'enabled' : 'true', 'runInBatchMode' : 'false'})
+        processorsPath = classpath_entries(names=processors)
+        for e in processorsPath:
+            if e.isDistribution():
+                out.element('factorypathentry', {'kind' : 'WKSPJAR', 'id' : '/{0}/{1}'.format(e.name, basename(e.path)), 'enabled' : 'true', 'runInBatchMode' : 'false'})
+            else:
+                out.element('factorypathentry', {'kind' : 'EXTJAR', 'id' : e.classpath_repr(resolve=True), 'enabled' : 'true', 'runInBatchMode' : 'false'})
         out.close('factorypath')
         update_file(join(p.dir, '.factorypath'), out.xml(indent='\t', newl='\n'))
         if files:
@@ -8703,10 +9153,14 @@ def _eclipseinit_suite(suite, buildProcessorJars=True, refreshOnly=False, logToC
         ensure_dir_exists(projectDir)
         relevantResources = []
         for d in dist.archived_deps():
+            # Eclipse does not seem to trigger a build for a distribution if the references
+            # to the constituent projects are of type IRESOURCE_PROJECT.
             if d.isProject():
-                for srcDir in d.source_dirs():
-                    relevantResources.append(join(d.name, os.path.relpath(srcDir, d.dir)))
-                relevantResources.append(join(d.name, os.path.relpath(d.output_dir(), d.dir)))
+                for srcDir in d.srcDirs:
+                    relevantResources.append(RelevantResource('/' + d.name + '/' + srcDir, IRESOURCE_FOLDER))
+                relevantResources.append(RelevantResource('/' +d.name + '/' + _get_eclipse_output_path(d), IRESOURCE_FOLDER))
+            elif d.isDistribution():
+                relevantResources.append(RelevantResource('/' +d.name, IRESOURCE_PROJECT))
         out = XMLDoc()
         out.open('projectDescription')
         out.element('name', data=dist.name)
@@ -8720,11 +9174,18 @@ def _eclipseinit_suite(suite, buildProcessorJars=True, refreshOnly=False, logToC
         javaCompliances = [_convert_to_eclipse_supported_compliance(p.javaCompliance) for p in dist.archived_deps() if p.isProject()]
         if len(javaCompliances) > 0:
             dist.javaCompliance = max(javaCompliances)
-        _genEclipseBuilder(out, dist, 'Create' + dist.name + 'Dist', '-v archive @' + dist.name, relevantResources=relevantResources, logToFile=True, refresh=False, async=False, logToConsole=logToConsole, appendToLogFile=False)
+        _genEclipseBuilder(out, dist, 'Create' + dist.name + 'Dist', '-v archive @' + dist.name, relevantResources=relevantResources, logToFile=True, refresh=True, async=False, logToConsole=logToConsole, appendToLogFile=False, refreshFile='/{0}/{1}'.format(dist.name, basename(dist.path)))
         out.close('buildSpec')
         out.open('natures')
         out.element('nature', data='org.eclipse.jdt.core.javanature')
         out.close('natures')
+        out.open('linkedResources')
+        out.open('link')
+        out.element('name', data=basename(dist.path))
+        out.element('type', data=str(IRESOURCE_FILE))
+        out.element('location', data=get_eclipse_project_rel_locationURI(dist.path, projectDir))
+        out.close('link')
+        out.close('linkedResources')
         out.close('projectDescription')
         projectFile = join(projectDir, '.project')
         update_file(projectFile, out.xml(indent='\t', newl='\n'))
@@ -8751,6 +9212,13 @@ def _zip_files(files, baseDir, zipPath):
         if exists(tmp):
             os.remove(tmp)
 
+RelevantResource = namedtuple('RelevantResource', ['path', 'type'])
+
+# http://grepcode.com/file/repository.grepcode.com/java/eclipse.org/4.4.2/org.eclipse.core/resources/3.9.1/org/eclipse/core/resources/IResource.java#76
+IRESOURCE_FILE = 1
+IRESOURCE_FOLDER = 2
+IRESOURCE_PROJECT = 4
+
 def _genEclipseBuilder(dotProjectDoc, p, name, mxCommand, refresh=True, refreshFile=None, relevantResources=None, async=False, logToConsole=False, logToFile=False, appendToLogFile=True, xmlIndent='\t', xmlStandalone=None):
     externalToolDir = join(p.dir, '.externalToolBuilders')
     launchOut = XMLDoc()
@@ -8776,15 +9244,16 @@ def _genEclipseBuilder(dotProjectDoc, p, name, mxCommand, refresh=True, refreshF
         if refreshFile is None:
             refreshScope = '${project}'
         else:
-            refreshScope = '${working_set:<?xml version="1.0" encoding="UTF-8"?><resources><item path="' + refreshFile + '" type="1"/></resources>}'
+            refreshScope = '${working_set:<?xml version="1.0" encoding="UTF-8"?><resources><item path="' + refreshFile + '" type="' + str(IRESOURCE_FILE) + '"/></resources>}'
 
         launchOut.element('booleanAttribute', {'key' : 'org.eclipse.debug.core.ATTR_REFRESH_RECURSIVE', 'value':  'false'})
         launchOut.element('stringAttribute', {'key' : 'org.eclipse.debug.core.ATTR_REFRESH_SCOPE', 'value':  refreshScope})
 
-    if relevantResources is not None:
+    if relevantResources:
+        # http://grepcode.com/file/repository.grepcode.com/java/eclipse.org/4.4.2/org.eclipse.debug/core/3.9.1/org/eclipse/debug/core/RefreshUtil.java#169
         resources = '${working_set:<?xml version="1.0" encoding="UTF-8"?><resources>'
         for relevantResource in relevantResources:
-            resources += '<item path="' + relevantResource + '" type="2" />'
+            resources += '<item path="' + relevantResource.path + '" type="' + str(relevantResource.type) + '"/>'
         resources += '</resources>}'
         launchOut.element('stringAttribute', {'key' : 'org.eclipse.ui.externaltools.ATTR_BUILD_SCOPE', 'value': resources})
 
@@ -9398,7 +9867,7 @@ def _intellij_suite(args, suite, refreshOnly=False):
     def _complianceToIntellijLanguageLevel(compliance):
         return 'JDK_1_' + str(compliance.value)
 
-    # create the modules (1 module  = 1 Intellij project)
+    # create the modules (1 IntelliJ module = 1 mx project/distribution)
     for p in suite.projects_recursive():
         if not p.isJavaProject():
             continue
@@ -9408,12 +9877,9 @@ def _intellij_suite(args, suite, refreshOnly=False):
 
         ensure_dir_exists(p.dir)
 
-        annotationProcessorProfileKey = tuple(p.annotation_processors())
-
-        if not annotationProcessorProfileKey in annotationProcessorProfiles:
-            annotationProcessorProfiles[annotationProcessorProfileKey] = [p]
-        else:
-            annotationProcessorProfiles[annotationProcessorProfileKey].append(p)
+        processors = p.annotation_processors()
+        if processors:
+            annotationProcessorProfiles.setdefault(tuple(processors), []).append(p)
 
         intellijLanguageLevel = _complianceToIntellijLanguageLevel(jdk.javaCompliance)
 
@@ -9421,8 +9887,7 @@ def _intellij_suite(args, suite, refreshOnly=False):
         moduleXml.open('module', attributes={'type': 'JAVA_MODULE', 'version': '4'})
 
         moduleXml.open('component', attributes={'name': 'NewModuleRootManager', 'LANGUAGE_LEVEL': intellijLanguageLevel, 'inherit-compiler-output': 'false'})
-        moduleXml.element('output', attributes={'url': 'file://$MODULE_DIR$/bin'})
-        moduleXml.element('exclude-output')
+        moduleXml.element('output', attributes={'url': 'file://$MODULE_DIR$/' + p.output_dir(relative=True)})
 
         moduleXml.open('content', attributes={'url': 'file://$MODULE_DIR$'})
         for src in p.srcDirs:
@@ -9430,10 +9895,10 @@ def _intellij_suite(args, suite, refreshOnly=False):
             ensure_dir_exists(srcDir)
             moduleXml.element('sourceFolder', attributes={'url':'file://$MODULE_DIR$/' + src, 'isTestSource': 'false'})
 
-        if len(p.annotation_processors()) > 0:
+        if processors:
             genDir = p.source_gen_dir()
             ensure_dir_exists(genDir)
-            moduleXml.element('sourceFolder', attributes={'url':'file://$MODULE_DIR$/' + os.path.relpath(genDir, p.dir), 'isTestSource': 'false'})
+            moduleXml.element('sourceFolder', attributes={'url':'file://$MODULE_DIR$/' + p.source_gen_dir_name(), 'isTestSource': 'false'})
 
         for name in ['.externalToolBuilders', '.settings', 'nbproject']:
             _intellij_exclude_if_exists(moduleXml, p, name)
@@ -9454,6 +9919,18 @@ def _intellij_suite(args, suite, refreshOnly=False):
         p.walk_deps(visit=processDep, ignoredEdges=[DEP_EXCLUDED])
 
         moduleXml.close('component')
+
+        # Checkstyle
+        csConfig = join(project(p.checkstyleProj, context=p).dir, '.checkstyle_checks.xml')
+        if exists(csConfig):
+            moduleXml.open('component', attributes={'name': 'CheckStyle-IDEA-Module'})
+            moduleXml.open('option', attributes={'name': 'configuration'})
+            moduleXml.open('map')
+            moduleXml.element('entry', attributes={'key' : "active-configuration", 'value': "PROJECT_RELATIVE:" + join(project(p.checkstyleProj).dir, ".checkstyle_checks.xml") + ":" + p.checkstyleProj})
+            moduleXml.close('map')
+            moduleXml.close('option')
+            moduleXml.close('component')
+
         moduleXml.close('module')
         moduleFile = join(p.dir, p.name + '.iml')
         update_file(moduleFile, moduleXml.xml(indent='  ', newl='\n'))
@@ -9514,6 +9991,9 @@ def _intellij_suite(args, suite, refreshOnly=False):
             compilerXml.element('sourceOutputDir', attributes={'name': 'src_gen'})  # TODO use p.source_gen_dir() ?
             compilerXml.element('outputRelativeToContentRoot', attributes={'value': 'true'})
             compilerXml.open('processorPath', attributes={'useClasspath': 'false'})
+
+            # IntelliJ supports both directories and jars on the annotation processor path whereas
+            # Eclipse only supports jars.
             for apDep in processors:
                 def processApDep(dep, edge):
                     if dep.isLibrary():
@@ -9532,13 +10012,95 @@ def _intellij_suite(args, suite, refreshOnly=False):
     compilerFile = join(ideaProjectDirectory, 'compiler.xml')
     update_file(compilerFile, compilerXml.xml(indent='  ', newl='\n'))
 
-    # Wite misc.xml for global JDK config
+    # Write misc.xml for global JDK config
     miscXml = XMLDoc()
-    miscXml.open('project', attributes={'version': '4'})
-    miscXml.element('component', attributes={'name': 'ProjectRootManager', 'version': '2', 'languageLevel': _complianceToIntellijLanguageLevel(jdk.javaCompliance), 'project-jdk-name': str(jdk.javaCompliance), 'project-jdk-type': 'JavaSDK'})
+    miscXml.open('project', attributes={'version' : '4'})
+
+    sources = suite.eclipse_settings_sources().get('org.eclipse.jdt.core.prefs')
+    if sources:
+        out = StringIO.StringIO()
+        print >> out, '# GENERATED -- DO NOT EDIT'
+        for source in sources:
+            print >> out, '# Source:', source
+            with open(source) as f:
+                for line in f:
+                    if line.startswith('org.eclipse.jdt.core.formatter.'):
+                        print >> out, line.strip()
+        formatterConfigFile = join(ideaProjectDirectory, 'EclipseCodeFormatter.prefs')
+        update_file(formatterConfigFile, out.getvalue())
+        miscXml.open('component', attributes={'name' : 'EclipseCodeFormatter'})
+        miscXml.element('option', attributes={'name' : 'formatter', 'value' : 'ECLIPSE'})
+        miscXml.element('option', attributes={'name' : 'id', 'value' : '1450878132508'})
+        miscXml.element('option', attributes={'name' : 'name', 'value' : suite.name})
+        miscXml.element('option', attributes={'name' : 'pathToConfigFileJava', 'value' : '$PROJECT_DIR$/.idea/' + basename(formatterConfigFile)})
+        miscXml.element('option', attributes={'name' : 'useOldEclipseJavaFormatter', 'value' : 'true'}) # Eclipse 4.4
+        miscXml.close('component')
+    miscXml.element('component', attributes={'name' : 'ProjectRootManager', 'version': '2', 'languageLevel': _complianceToIntellijLanguageLevel(jdk.javaCompliance), 'project-jdk-name': str(jdk.javaCompliance), 'project-jdk-type': 'JavaSDK'})
     miscXml.close('project')
     miscFile = join(ideaProjectDirectory, 'misc.xml')
     update_file(miscFile, miscXml.xml(indent='  ', newl='\n'))
+
+    # Write checkstyle-idea.xml for the CheckStyle-IDEA
+    checkstyleXml = XMLDoc()
+    checkstyleXml.open('project', attributes={'version': '4'})
+    checkstyleXml.open('component', attributes={'name': 'CheckStyle-IDEA'})
+    checkstyleXml.open('option', attributes={'name' : "configuration"})
+    checkstyleXml.open('map')
+
+    # Initialize an entry for each style that is used
+    checkstyleProjects = set([])
+    for p in suite.projects_recursive():
+        if not p.isJavaProject():
+            continue
+        csConfig = join(project(p.checkstyleProj, context=p).dir, '.checkstyle_checks.xml')
+        if p.checkstyleProj in checkstyleProjects or not exists(csConfig):
+            continue
+        checkstyleProjects.add(p.checkstyleProj)
+        checkstyleXml.element('entry', attributes={'key' : "location-" + str(len(checkstyleProjects)), 'value': "PROJECT_RELATIVE:" + join(project(p.checkstyleProj).dir, ".checkstyle_checks.xml") + ":" + p.checkstyleProj})
+
+    checkstyleXml.close('map')
+    checkstyleXml.close('option')
+    checkstyleXml.close('component')
+    checkstyleXml.close('project')
+    checkstyleFile = join(ideaProjectDirectory, 'checkstyle-idea.xml')
+    update_file(checkstyleFile, checkstyleXml.xml(indent='  ', newl='\n'))
+
+    # mx integration
+    # 1) Make an ant file for archiving the project.
+    antXml = XMLDoc()
+    antXml.open('project', attributes={'name': suite.name, 'default': 'archive'})
+    antXml.open('target', attributes={'name': 'archive'})
+    antXml.open('exec', attributes={'executable': '/bin/bash'})
+    antXml.element('arg', attributes={'value': 'mx'})
+    antXml.element('arg', attributes={'value': 'archive'})
+
+    distDeps = set([])
+    for p in suite.projects_recursive():
+        for dep in p.deps:
+            if dep.isJARDistribution():
+                distDeps.add(dep.name)
+
+    for dist in distDeps:
+        antXml.element('arg', attributes={'value': '@' + dist})
+
+    antXml.close('exec')
+    antXml.close('target')
+    antXml.close('project')
+    antFile = join(ideaProjectDirectory, 'ant-mx-archive.xml')
+    update_file(antFile, antXml.xml(indent='  ', newl='\n'))
+
+    # 2) Tell IDEA that there is an ant-build.
+    metaAntXml = XMLDoc()
+    metaAntXml.open('project', attributes={'version': '4'})
+    metaAntXml.open('component', attributes={'name': 'AntConfiguration'})
+    metaAntXml.open('buildFile', attributes={'url': 'file://$PROJECT_DIR$/.idea/ant-mx-archive.xml'})
+    metaAntXml.element('executeOn', attributes={'event': 'afterCompilation', 'target': 'archive'})
+    metaAntXml.close('buildFile')
+    metaAntXml.close('component')
+    metaAntXml.close('project')
+    metaAntFile = join(ideaProjectDirectory, 'ant.xml')
+    update_file(metaAntFile, metaAntXml.xml(indent='  ', newl='\n'))
+
 
     # TODO look into copyright settings
     # TODO should add vcs.xml support
@@ -9643,7 +10205,9 @@ def find_packages(project, pkgs=None, onlyPublic=True, packages=None, exclude_pa
                         pkgs.add(pkg)
     return pkgs
 
-def javadoc(args, parser=None, docDir='javadoc', includeDeps=True, stdDoclet=True):
+_javadocRefNotFound = re.compile("Tag @link(plain)?: reference not found: ")
+
+def javadoc(args, parser=None, docDir='javadoc', includeDeps=True, stdDoclet=True, mayBuild=True, quietForNoPackages=False):
     """generate javadoc for some/all Java projects"""
 
     parser = ArgumentParser(prog='mx javadoc') if parser is None else parser
@@ -9658,13 +10222,16 @@ def javadoc(args, parser=None, docDir='javadoc', includeDeps=True, stdDoclet=Tru
     parser.add_argument('-m', '--memory', action='store', help='-Xmx value to pass to underlying JVM')
     parser.add_argument('--packages', action='store', help='comma separated packages to process (omit to process all packages)')
     parser.add_argument('--exclude-packages', action='store', help='comma separated packages to exclude')
+    parser.add_argument('--allow-warnings', action='store_true', help='Exit normally even if warnings were found')
 
     args = parser.parse_args(args)
 
     # build list of projects to be processed
     if args.projects is not None:
+        partialJavadoc = True
         candidates = [project(name) for name in args.projects.split(',')]
     else:
+        partialJavadoc = False
         candidates = projects_opt_limit_to_suites()
 
     # optionally restrict packages within a project
@@ -9686,22 +10253,34 @@ def javadoc(args, parser=None, docDir='javadoc', includeDeps=True, stdDoclet=Tru
 
     def assess_candidate(p, projects):
         if p in projects:
-            return False
+            return (False, 'Already visited')
         if not args.implementation and p.name.endswith('.test'):
-            return False
+            return (False, 'Test project')
         if args.force or args.unified or check_package_list(p):
             projects.append(p)
-            return True
-        return False
+            return (True, None)
+        return (False, 'package-list file exists')
 
     projects = []
     for p in candidates:
         if p.isJavaProject():
             if includeDeps:
-                p.walk_deps(visit=lambda dep, edge: assess_candidate(dep, projects) if dep.isProject() else None)
-            if not assess_candidate(p, projects):
-                logv('[package-list file exists - skipping {0}]'.format(p.name))
-   
+                p.walk_deps(visit=lambda dep, edge: assess_candidate(dep, projects)[0] if dep.isProject() else None)
+            added, reason = assess_candidate(p, projects)
+            if not added:
+                logv('[{0} - skipping {1}]'.format(reason, p.name))
+    snippets = []
+    for p in projects_opt_limit_to_suites():
+        if p.isJavaProject():
+            snippets += p.source_dirs()
+    snippets = os.pathsep.join(snippets)
+    snippetslib = library('CODESNIPPET-DOCLET').get_path(resolve=True)
+
+    if not projects:
+        log('All projects were skipped.')
+        if not _opts.verbose:
+            log('Re-run with global -v option to see why.')
+        return
 
     extraArgs = [a.lstrip('@') for a in args.extra_args]
     if args.argfile is not None:
@@ -9711,8 +10290,9 @@ def javadoc(args, parser=None, docDir='javadoc', includeDeps=True, stdDoclet=Tru
         memory = args.memory
     memory = '-J-Xmx' + memory
 
-    # The project must be built to ensure javadoc can find class files for all referenced classes
-    build(['--no-native', '--dependencies', ','.join((p.name for p in projects))])
+    if mayBuild:
+        # The project must be built to ensure javadoc can find class files for all referenced classes
+        build(['--no-native', '--dependencies', ','.join((p.name for p in projects))])
     if not args.unified:
         for p in projects:
             pkgs = find_packages(p, set(), False, packages, exclude_packages)
@@ -9737,6 +10317,12 @@ def javadoc(args, parser=None, docDir='javadoc', includeDeps=True, stdDoclet=Tru
             if not args.warnAPI:
                 nowarnAPI.append('-XDignore.symbol.file')
 
+            if not pkgs:
+                if quietForNoPackages:
+                    return
+                else:
+                    abort('No packages to generate javadoc for!')
+
             # windowTitle onloy applies to the standard doclet processor
             windowTitle = []
             if stdDoclet:
@@ -9757,6 +10343,9 @@ def javadoc(args, parser=None, docDir='javadoc', includeDeps=True, stdDoclet=Tru
                      '-d', out,
                      '-overview', overviewFile,
                      '-sourcepath', sp,
+                     '-doclet', 'org.apidesign.javadoc.codesnippet.Doclet',
+                     '-docletpath', snippetslib,
+                     '-snippetpath', snippets,
                      '-source', str(jdk.javaCompliance)] +
                      jdk.javadocLibOptions([]) +
                      ([] if jdk.javaCompliance < JavaCompliance('1.8') else ['-Xdoclint:none']) +
@@ -9816,23 +10405,43 @@ def javadoc(args, parser=None, docDir='javadoc', includeDeps=True, stdDoclet=Tru
             groupargs.append('-group')
             groupargs.append(k)
             groupargs.append(':'.join(v))
+
+        if not pkgs:
+            if quietForNoPackages:
+                return
+            else:
+                abort('No packages to generate javadoc for!')
+
         log('Generating {2} for {0} in {1}'.format(', '.join(names), out, docDir))
-        class Capture:
-            def __init__(self, prefix):
+
+        class WarningCapture:
+            def __init__(self, prefix, forward, ignoreBrokenRefs):
                 self.prefix = prefix
-                self.last = ''
+                self.forward = forward
+                self.ignoreBrokenRefs = ignoreBrokenRefs
+                self.warnings = 0
 
             def __call__(self, msg):
-                self.last = msg
-                print(self.prefix + msg),
+                shouldPrint = self.forward
+                if ': warning - ' in  msg:
+                    if not self.ignoreBrokenRefs or not _javadocRefNotFound.search(msg):
+                        self.warnings += 1
+                        shouldPrint = True
+                    else:
+                        shouldPrint = False
+                if shouldPrint or _opts.verbose:
+                    log(self.prefix + msg)
 
-        captureOut = Capture('stdout: ')
-        captureErr = Capture('stderr: ')
+        captureOut = WarningCapture('stdout: ', False, partialJavadoc)
+        captureErr = WarningCapture('stderr: ', True, partialJavadoc)
 
         run([get_jdk().javadoc, memory,
              '-classpath', cp,
              '-quiet',
              '-d', out,
+             '-doclet', 'org.apidesign.javadoc.codesnippet.Doclet',
+             '-docletpath', snippetslib,
+             '-snippetpath', snippets,
              '-sourcepath', sp] +
              ([] if jdk.javaCompliance < JavaCompliance('1.8') else ['-Xdoclint:none']) +
              (['-overview', overviewFile] if exists(overviewFile) else []) +
@@ -9842,8 +10451,10 @@ def javadoc(args, parser=None, docDir='javadoc', includeDeps=True, stdDoclet=Tru
              nowarnAPI +
              list(pkgs), True, captureOut, captureErr)
 
-        if 'warning' in captureOut.last:
+        if not args.allow_warnings and captureErr.warnings:
             abort('Error: Warnings in the javadoc are not allowed!')
+        if args.allow_warnings and not captureErr.warnings:
+            logv("Warnings were allowed but there was none")
 
         log('Generated {2} for {0} in {1}'.format(', '.join(names), out, docDir))
 
@@ -10300,6 +10911,8 @@ def _sforce_imports(importing_suite, imported_suite, suite_import, import_map, s
                         abort('aborting')
                 else:
                     abort('Uncommited changes in {}, aborting.'.format(imported_suite.name))
+            if imported_suite.vc.kind != suite_import.kind:
+                abort('Wrong VC type for {} ({}), expecting {}, got {}'.format(imported_suite.name, imported_suite.dir, suite_import.kind, imported_suite.vc.kind))
             imported_suite.vc.update(imported_suite.dir, suite_import_version, mayPull=True, clean=True)
     else:
         # unusual case, no version specified, so pull the head
@@ -10331,6 +10944,8 @@ def _spull(importing_suite, imported_suite, suite_import, update_versions, only_
         vcs = imported_suite.vc
         # by default we pull to the revision id in the import, but pull head if update_versions = True
         rev = suite_import.version if not update_versions and suite_import and suite_import.version else None
+        if rev and vcs.kind != suite_import.kind:
+            abort('Wrong VC type for {} ({}), expecting {}, got {}'.format(imported_suite.name, imported_suite.dir, suite_import.kind, imported_suite.vc.kind))
         vcs.pull(imported_suite.dir, rev, update=not no_update)
 
     if not primary and update_versions:
@@ -11555,7 +12170,7 @@ def main():
         # no need to show the stack trace when the user presses CTRL-C
         abort(1)
 
-version = VersionSpec("5.6.5")
+version = VersionSpec("5.6.11")
 
 currentUmask = None
 

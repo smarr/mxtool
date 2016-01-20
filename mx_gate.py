@@ -222,7 +222,9 @@ def gate(args):
                             mx.log(fp.read().strip())
 
         with Task('Pylint', tasks) as t:
-            if t: mx.command_function('pylint')([])
+            if t:
+                if mx.command_function('pylint')([]) != 0:
+                    _warn_or_abort('Pylint not configured correctly. Cannot execute Pylint task.', args.strict_mode)
 
         gate_clean(cleanArgs, tasks)
 

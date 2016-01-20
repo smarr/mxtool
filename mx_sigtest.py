@@ -83,6 +83,11 @@ def _sigtest_check(checktype, args, suite=None, projects=None):
         return 1
     javaCompliance = max([p.javaCompliance for p in nonTestProjects])
 
+    class OutputCapture:
+        def __init__(self):
+            self.data = ""
+        def __call__(self, data):
+            self.data += data
     failed = None
     for p in nonTestProjects:
         sigtestResults = p.dir + os.sep + 'snapshot.sigtest'
@@ -96,9 +101,28 @@ def _sigtest_check(checktype, args, suite=None, projects=None):
             cmd.append('-b')
         for pkg in mx.find_packages(p):
             cmd = cmd + ['-PackageWithoutSubpackages', pkg]
-        exitcode = mx.run_java(cmd, nonZeroIsFatal=False, jdk=mx.get_jdk(javaCompliance))
-        if exitcode != 95:
-            failed = sigtestResults
+        out = OutputCapture()
+        print 'Checking ' + checktype + ' signature changes against ' + sigtestResults
+        exitcode = mx.run_java(cmd, nonZeroIsFatal=False, jdk=mx.get_jdk(javaCompliance), out=out, err=out)
+        mx.ensure_dir_exists(p.get_output_root())
+        with open(p.get_output_root() + os.path.sep + 'sigtest-junit.xml', 'w') as f:
+            f.write('<?xml version="1.0" encoding="UTF-8" ?>\n')
+            f.write('<testsuite tests="1" name="' + p.name + '.sigtest.' + checktype + '">\n')
+            f.write('<testcase classname="' + p.name + '" name="sigtest.' + checktype + '">\n')
+            if exitcode != 95:
+                print out.data
+                failed = sigtestResults
+                f.write('<failure type="SignatureCheck"><![CDATA[\n')
+                f.write(out.data)
+                f.write(']]></failure>')
+            else:
+                f.write('<system-err><![CDATA[\n')
+                f.write(out.data)
+                f.write(']]></system-err>')
+            f.write('</testcase>\n')
+            f.write('</testsuite>\n')
     if failed:
         mx.abort('Signature error in ' + failed)
+    else:
+        print 'OK.'
     return 0
